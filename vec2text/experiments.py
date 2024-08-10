@@ -20,7 +20,8 @@ from vec2text.models import (
     CorrectorEncoderModel,
     InversionFromLogitsEmbModel,
     InversionFromLogitsModel,
-    InversionModel,
+    MLPInversionModel,
+    AttentionInversionModel,
     InversionModelBagOfWords,
     InversionModelDecoderOnly,
     InversionModelNonAutoregressive,
@@ -621,10 +622,17 @@ class InversionExperiment(Experiment):
     def _wandb_project_name(self) -> str:
         return "emb-inv-4"
 
-    def load_model(self) -> transformers.PreTrainedModel:
-        return InversionModel(
-            config=self.config,
-        )
+    def load_model(self, inversion_trainer) -> transformers.PreTrainedModel:
+        if self.model_args.model_type == "mlp":
+            model = MLPInversionModel(
+                config=self.config,
+            )
+        elif self.model_args.model_type == "attention":
+            model = AttentionInversionModel(config=self.config)
+        else:
+            raise ValueError(f"Unknown model type {self.model_args.model_type}")
+        
+        return model
 
     def load_trainer(self) -> transformers.Trainer:
         model = self.load_model()

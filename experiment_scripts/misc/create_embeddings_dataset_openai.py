@@ -18,7 +18,6 @@ from vec2text.models.model_utils import mean_pool
 from vec2text.utils import dataset_map_multi_worker
 
 MAX_LENGTH = 128
-OPENAI_ADA2_MODEL = "text-embedding-ada-002"
 
 
 def parse_args() -> argparse.Namespace:
@@ -27,20 +26,22 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-encoding = tiktoken.encoding_for_model("text-embedding-ada-002")
 
 
 @retry(wait=wait_fixed(1), stop=stop_after_attempt(10))
-def embed_openai_ada2(example: Dict) -> Dict:
+def embed_openai(example: Dict, model_name: str) -> Dict:
     from concurrent.futures import ThreadPoolExecutor
 
     from openai import OpenAI
 
+    encoding = tiktoken.encoding_for_model(model_name)
+
+    # Encode and truncate text as needed
     text_tokens = encoding.encode_batch(example["text"])
     text_tokens = [tok[:MAX_LENGTH] for tok in text_tokens]
     text_list = encoding.decode_batch(text_tokens)
 
-    model = OPENAI_ADA2_MODEL
+    # Initialize OpenAI Client
     client = OpenAI()
 
     # print(f"running openai on text_list of length {len(text_list)}, first element '{text_list[0]}'")
@@ -56,7 +57,7 @@ def embed_openai_ada2(example: Dict) -> Dict:
     def process_batch(batch):
         text_list_batch = text_list[batch * 128 : (batch + 1) * 128]
         response = client.embeddings.create(
-            input=text_list_batch, model=model, encoding_format="float"
+            input=text_list_batch, model=model_name, encoding_format="float"
         )
         return [e.embedding for e in response.data]
 
@@ -76,11 +77,12 @@ def embed_openai_ada2(example: Dict) -> Dict:
 def main():
     datasets.disable_caching()
     args = parse_args()
-
+    model_name = "text-embedding-3-large"
+    
     full_name = "__".join(
         (
             args.dataset,
-            "openai_ada2",
+            model_name,
         )
     )
 
