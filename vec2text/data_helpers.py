@@ -150,12 +150,12 @@ def load_beir_corpus(name: str) -> List[str]:
     from beir.datasets.data_loader import GenericDataLoader
 
     #### Download scifact.zip dataset and unzip the dataset
-    beir_datasets_cache_dir = "/home/jxm3/research/retrieval/distractor_exp"
+    beir_cache_dir= "beir_cache"
 
     url = "https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/{}.zip".format(
         name
     )
-    out_dir = os.path.join(beir_datasets_cache_dir, "datasets")
+    out_dir = os.path.join(beir_cache_dir, "datasets")
     data_path = beir_util.download_and_unzip(url, out_dir)
 
     # Limit each corpus to first 100k documents.
