@@ -1,7 +1,6 @@
 import logging
 import os
 import random
-import zipfile
 from typing import Dict, List
 
 import datasets
@@ -151,17 +150,13 @@ def load_beir_corpus(name: str) -> List[str]:
     from beir.datasets.data_loader import GenericDataLoader
 
     #### Download scifact.zip dataset and unzip the dataset
-    beir_cache_dir = "beir_cache"
+    beir_cache_dir= "beir_cache"
 
-    url = "https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/{}.zip".format(name)
+    url = "https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/{}.zip".format(
+        name
+    )
     out_dir = os.path.join(beir_cache_dir, "datasets")
-    zip_file = beir_util.download(url, out_dir)
-
-    # Check if the downloaded file is a valid ZIP file
-    if not zipfile.is_zipfile(zip_file):
-        raise zipfile.BadZipFile(f"The downloaded file is not a valid ZIP file: {zip_file}")
-
-    data_path = beir_util.unzip(zip_file, out_dir)
+    data_path = beir_util.download_and_unzip(url, out_dir)
 
     # Limit each corpus to first 100k documents.
     MAX_N = 100_000
