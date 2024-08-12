@@ -147,7 +147,14 @@ def load_python_code_instructions_18k_alpaca() -> datasets.Dataset:
 
 def load_beir_corpus(name: str) -> List[str]:
     from beir import util as beir_util
+    from beir import LoggingHandler
     from beir.datasets.data_loader import GenericDataLoader
+
+    #### Just some code to print debug information to stdout
+    logging.basicConfig(format='%(asctime)s - %(message)s',
+                    datefmt='%Y-%m-%d %H:%M:%S',
+                    level=logging.INFO,
+                    handlers=[LoggingHandler()])
 
     #### Download scifact.zip dataset and unzip the dataset
     beir_cache_dir= "beir_cache"
@@ -155,6 +162,7 @@ def load_beir_corpus(name: str) -> List[str]:
     url = "https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/{}.zip".format(
         name
     )
+    logging.info(f"Attempting to download {url}")
     out_dir = os.path.join(beir_cache_dir, "datasets")
     data_path = beir_util.download_and_unzip(url, out_dir)
 
