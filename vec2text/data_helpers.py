@@ -157,7 +157,6 @@ def load_beir_corpus(name: str) -> List[str]:
     )
     print(f"Attempting to download: {url}")
     out_dir = os.path.join(beir_cache_dir, "datasets")
-    print(f"out_dir is: {out_dir}")
     data_path = beir_util.download_and_unzip(url, out_dir)
 
     # Limit each corpus to first 100k documents.
@@ -233,10 +232,10 @@ def load_beir_datasets() -> datasets.DatasetDict:
         "trec-covid",
         "webis-touche2020",
         ####### private datasets #######
-        "signal1m",
-        "trec-news",
-        "robust04",
-        "bioasq",
+        #"signal1m",
+        #"trec-news",
+        #"robust04",
+        #"bioasq",
     ]
     return datasets.DatasetDict({k: load_beir_dataset(k) for k in all_beir_datasets})
 
