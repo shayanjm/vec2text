@@ -26,13 +26,9 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-
-
 @retry(wait=wait_fixed(1), stop=stop_after_attempt(10))
 def embed_openai(example: Dict, model_name: str) -> Dict:
     from concurrent.futures import ThreadPoolExecutor
-
-    from openai import OpenAI
 
     encoding = tiktoken.encoding_for_model(model_name)
 
@@ -42,9 +38,7 @@ def embed_openai(example: Dict, model_name: str) -> Dict:
     text_list = encoding.decode_batch(text_tokens)
 
     # Initialize OpenAI Client
-    client = OpenAI()
-
-    # print(f"running openai on text_list of length {len(text_list)}, first element '{text_list[0]}'")
+    client = openai.OpenAI()  # Ensure correct client initialization
 
     batches = math.ceil(len(text_list) / 128)
     outputs = []
@@ -97,11 +91,14 @@ def main():
     dataset = all_datasets[args.dataset]
 
     print(f"[*] embedding {args.dataset}")
+    # Use functools.partial to pass the model_name to embed_openai
+    map_fn = functools.partial(embed_openai, model_name=model_name)
+
     dataset = dataset_map_multi_worker(
         dataset,
         batched=True,
         batch_size=128,
-        map_fn=functools.partial(embed_openai_ada2),
+        map_fn=map_fn,  # Use the partial function here
         num_proc=1,
     )
     print(f"pushing to hub with name {full_name}")
