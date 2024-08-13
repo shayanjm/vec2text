@@ -17,9 +17,6 @@ from vec2text.models import load_embedder_and_tokenizer
 from vec2text.models.model_utils import mean_pool
 from vec2text.utils import dataset_map_multi_worker
 
-max_tokens = 128
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Process dataset and embedders")
     parser.add_argument("dataset", type=str, help="Path or name of the dataset")
@@ -84,7 +81,7 @@ def main():
             model_name,
         )
     )
-
+    print(f"Embedding {args.dataset} dataset using {model_name}. Truncating to {args.max_tokens} tokens. Saving dataset to HuggingFace as {full_name}")
     all_datasets = {
         **load_standard_val_datasets(),
         **load_beir_datasets(),
