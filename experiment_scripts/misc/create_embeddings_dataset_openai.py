@@ -17,24 +17,28 @@ from vec2text.models import load_embedder_and_tokenizer
 from vec2text.models.model_utils import mean_pool
 from vec2text.utils import dataset_map_multi_worker
 
-MAX_LENGTH = 128
+max_tokens = 128
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Process dataset and embedders")
     parser.add_argument("dataset", type=str, help="Path or name of the dataset")
+    parser.add_argument("--max_tokens",
+                        type=int,
+                        default=128,
+                        help="Maximum number of tokens for truncation (default: 128)")
     return parser.parse_args()
 
 
 @retry(wait=wait_fixed(1), stop=stop_after_attempt(10))
-def embed_openai(example: Dict, model_name: str) -> Dict:
+def embed_openai(example: Dict, model_name: str, max_tokens: int) -> Dict:
     from concurrent.futures import ThreadPoolExecutor
 
     encoding = tiktoken.encoding_for_model(model_name)
 
     # Encode and truncate text as needed
     text_tokens = encoding.encode_batch(example["text"])
-    text_tokens = [tok[:MAX_LENGTH] for tok in text_tokens]
+    text_tokens = [tok[:max_tokens] for tok in text_tokens]
     text_list = encoding.decode_batch(text_tokens)
 
     # Initialize OpenAI Client
@@ -76,6 +80,7 @@ def main():
     full_name = "__".join(
         (
             args.dataset,
+            f"trunc-{args.max_tokens}"
             model_name,
         )
     )
@@ -89,10 +94,11 @@ def main():
         args.dataset in all_datasets
     ), f"unknown dataset {args.dataset}; choices {all_datasets.keys()}"
     dataset = all_datasets[args.dataset]
+    max_tokens = args.max_tokens
 
     print(f"[*] embedding {args.dataset}")
     # Use functools.partial to pass the model_name to embed_openai
-    map_fn = functools.partial(embed_openai, model_name=model_name)
+    map_fn = functools.partial(embed_openai, model_name=model_name, max_tokens=max_tokens)
 
     dataset = dataset_map_multi_worker(
         dataset,
