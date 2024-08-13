@@ -77,7 +77,7 @@ def main():
     full_name = "__".join(
         (
             args.dataset,
-            f"trunc-{args.max_tokens}"
+            f"trunc-{args.max_tokens}",
             model_name,
         )
     )
