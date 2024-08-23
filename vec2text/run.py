@@ -8,14 +8,14 @@ def main():
         (ModelArguments, DataArguments, TrainingArguments)
     )
 
-    # Add the model_type argument manually
-    parser.add_argument("--model_type", choices=["mlp", "attention"], required=True, help="Model type to use (mlp or attention)")
+    # Add the architecture_type argument manually
+    parser.add_argument("--architecture_type", choices=["mlp", "attention"], required=True, help="Architecture type to use (mlp or attention)")
     
-    # Parse arguments including the new model_type argument
+    # Parse arguments including the new architecture_type argument
     model_args, data_args, training_args, additional_args = parser.parse_args_into_dataclasses(return_remaining_strings=True)
     
-    # Assign the model_type to the model_args
-    model_args.model_type = additional_args[0]  # Assuming model_type is the only additional argument
+    # Assign the architecture type to the model_args
+    model_args.architecture_type = additional_args[0]  # Assuming architecture_type is the only additional argument
     
     # Pass the arguments to the experiment setup
     experiment = experiment_from_args(model_args, data_args, training_args)

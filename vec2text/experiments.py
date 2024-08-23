@@ -623,14 +623,14 @@ class InversionExperiment(Experiment):
         return "emb-inv-4"
 
     def load_model(self, inversion_trainer) -> transformers.PreTrainedModel:
-        if self.model_args.model_type == "mlp":
+        if self.model_args.architecture_type == "mlp":
             model = MLPInversionModel(
                 config=self.config,
             )
-        elif self.model_args.model_type == "attention":
+        elif self.model_args.architecture_type == "attention":
             model = AttentionInversionModel(config=self.config)
         else:
-            raise ValueError(f"Unknown model type {self.model_args.model_type}")
+            raise ValueError(f"Unknown architecture type {self.model_args.architecture_type}")
         
         return model
 
