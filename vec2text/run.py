@@ -10,16 +10,14 @@ def main():
 
     # Add the architecture_type argument manually
     parser.add_argument("--architecture_type", choices=["mlp", "attention"], required=True, help="Architecture type to use (mlp or attention)")
-
+    
     # Parse arguments including the new architecture_type argument
-    model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    model_args, data_args, training_args, additional_args = parser.parse_args_into_dataclasses()
 
-    # Handle additional arguments separately if necessary
-    additional_args = parser.parse_known_args()[1]  # This gets the remaining arguments
-
-    # Check if there are any remaining arguments and assign them properly
-    if additional_args:
-        model_args.architecture_type = additional_args[0]
+    print(f"Additional Args: {additional_args}")
+    
+    # Assign the architecture type to the model_args
+    model_args.architecture_type = additional_args[0]  # Assuming architecture_type is the only additional argument
     
     # Pass the arguments to the experiment setup
     experiment = experiment_from_args(model_args, data_args, training_args)
