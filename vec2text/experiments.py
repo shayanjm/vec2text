@@ -622,7 +622,7 @@ class InversionExperiment(Experiment):
     def _wandb_project_name(self) -> str:
         return "emb-inv-4"
 
-    def load_model(self, inversion_trainer) -> transformers.PreTrainedModel:
+    def load_model(self) -> transformers.PreTrainedModel:
         if self.model_args.architecture_type == "mlp":
             model = MLPInversionModel(
                 config=self.config,
