@@ -17,7 +17,7 @@ def main():
     print(f"Additional Args: {additional_args}")
     
     # Assign the architecture type to the model_args
-    model_args.architecture_type = additional_args[0]  # Assuming architecture_type is the only additional argument
+    model_args.architecture_type = additional_args.architecture_type  # Assuming architecture_type is the only additional argument
     
     # Pass the arguments to the experiment setup
     experiment = experiment_from_args(model_args, data_args, training_args)
