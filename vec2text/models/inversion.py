@@ -34,14 +34,20 @@ class InversionModel(transformers.PreTrainedModel):
     encoder_decoder: transformers.AutoModelForSeq2SeqLM
     encoder_decoder_lora: bool  # Whether to use LoRA for the encoder-decoder model
     tokenizer: transformers.PreTrainedTokenizer  # encoder_decoder's tokenizer
-    embedding_transform: nn.Module  # Module that transformers embedder output into encoder-decoder input
+    embedding_transform: (
+        nn.Module
+    )  # Module that transformers embedder output into encoder-decoder input
     bottleneck_dim: int  # Bottleneck dimension for embedding_transform
     num_repeat_tokens: int  # Sequence length for repeating embedder embedding for encoder-decoder input
     embedder_dim: int  # Hidden dimension of embedding model
     embedder_no_grad: bool  # Disable gradients for embedding model
     embedder_fake_with_zeros: bool  # Whether to just provide zeros as input for encoder-decoder (unconditional)
-    embedding_transform_strategy: str  # Way to transform bottleneck embedding into input for encoder-decoder
-    use_frozen_embeddings_as_input: bool  # Whether to train/evaluate on frozen embeddings
+    embedding_transform_strategy: (
+        str  # Way to transform bottleneck embedding into input for encoder-decoder
+    )
+    use_frozen_embeddings_as_input: (
+        bool  # Whether to train/evaluate on frozen embeddings
+    )
     embedded_tokens: torch.Tensor  # used for decoding
     embedder_model_api: Optional[str]
 
@@ -237,19 +243,16 @@ class InversionModel(transformers.PreTrainedModel):
         if self.embedding_transform_strategy == "repeat":
             if embeddings.dtype != self.dtype:
                 embeddings = embeddings.to(self.dtype)
-            
+
             # Reshape embeddings for attention
             embeddings = embeddings.unsqueeze(1)  # [batch_size, 1, embedder_dim]
 
             # Apply the attention-based transformation
-            transformed_embeddings, _ = self.embedding_transform(embeddings, embeddings, embeddings)
-            
-            # Reshape to match the expected output
-            repeated_embeddings = transformed_embeddings.squeeze(1)
+            transformed_embeddings, _ = self.embedding_transform(embeddings)
 
-            # linear outputs a big embedding, reshape into a sequence of regular size embeddings.
-            embeddings = repeated_embeddings.reshape(
-                (*repeated_embeddings.shape[:-1], self.num_repeat_tokens, -1)
+            # Reshape to match the expected output
+            embeddings = transformed_embeddings.reshape(
+                (*transformed_embeddings.shape[:-1], self.num_repeat_tokens, -1)
             )
 
         elif self.embedding_transform_strategy == "nearest_neighbors":
