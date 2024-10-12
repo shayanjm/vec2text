@@ -52,8 +52,7 @@ class InversionModel(transformers.PreTrainedModel):
     embedder_model_api: Optional[str]
 
     def __init__(self, config: InversionConfig):
-       super().__init__(config=config)
-
+        super().__init__(config=config)
         embedder_model_api = config.embedder_model_api
         embedder_fake_with_zeros = config.embedder_fake_with_zeros
         use_frozen_embeddings_as_input = config.use_frozen_embeddings_as_input
