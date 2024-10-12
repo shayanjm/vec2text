@@ -244,11 +244,13 @@ class InversionModel(transformers.PreTrainedModel):
             if embeddings.dtype != self.dtype:
                 embeddings = embeddings.to(self.dtype)
 
-            # Reshape embeddings for attention
-            embeddings = embeddings.unsqueeze(1)  # [batch_size, 1, embedder_dim]
+            query = key = value = embeddings
 
             # Apply the attention-based transformation
-            transformed_embeddings, _ = self.embedding_transform(embeddings)
+            transformed_embeddings, _ = self.embedding_transform[1](query, key, value)
+
+            # Pass through the remaining layers in the Sequential
+            transformed_embeddings = self.embedding_transform[2:](transformed_embeddings)
 
             # Reshape to match the expected output
             embeddings = transformed_embeddings.reshape(
