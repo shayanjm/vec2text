@@ -4,6 +4,7 @@ from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
+from torch.nn import MultiheadAttentio
 import transformers
 from sentence_transformers import SentenceTransformer
 
@@ -95,7 +96,7 @@ class InversionModel(transformers.PreTrainedModel):
         self.embedding_transform = nn.Sequential(
             nn.Linear(self.embedder_dim, bottleneck_dim),
             nn.Dropout(self.encoder_decoder.config.dropout_rate),
-            nn.GELU(),  # TODO consider dropout or normalization here.
+            MultiheadAttention(encoder_hidden_dim, num_heads=8, batch_first=True),
             nn.Linear(bottleneck_dim, encoder_hidden_dim * num_repeat_tokens),
         )
         if encoder_dropout_disabled:
@@ -236,11 +237,21 @@ class InversionModel(transformers.PreTrainedModel):
         if self.embedding_transform_strategy == "repeat":
             if embeddings.dtype != self.dtype:
                 embeddings = embeddings.to(self.dtype)
-            repeated_embeddings = self.embedding_transform(embeddings)
+            
+            # Reshape embeddings for attention
+            embeddings = embeddings.unsqueeze(1)  # [batch_size, 1, embedder_dim]
+
+            # Apply the attention-based transformation
+            transformed_embeddings, _ = self.embedding_transform(embeddings, embeddings, embeddings)
+            
+            # Reshape to match the expected output
+            repeated_embeddings = transformed_embeddings.squeeze(1)
+
             # linear outputs a big embedding, reshape into a sequence of regular size embeddings.
             embeddings = repeated_embeddings.reshape(
                 (*repeated_embeddings.shape[:-1], self.num_repeat_tokens, -1)
             )
+            
         elif self.embedding_transform_strategy == "nearest_neighbors":
             # TODO
             raise NotImplementedError()
