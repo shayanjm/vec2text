@@ -52,7 +52,7 @@ class InversionModel(transformers.PreTrainedModel):
     embedder_model_api: Optional[str]
 
     def __init__(self, config: InversionConfig):
-        super().__init__(config=config)
+       super().__init__(config=config)
 
         embedder_model_api = config.embedder_model_api
         embedder_fake_with_zeros = config.embedder_fake_with_zeros
@@ -77,16 +77,12 @@ class InversionModel(transformers.PreTrainedModel):
         num_repeat_tokens = config.num_repeat_tokens
         embedder_no_grad = config.embedder_no_grad
 
-        self.encoder_decoder = encoder_decoder  # .to_bettertransformer()
-        ######################################################
+        self.encoder_decoder = encoder_decoder
         self.num_repeat_tokens = num_repeat_tokens
-
-        self.embedder_is_decoder = False
 
         encoder_hidden_dim = self.encoder_decoder.config.hidden_size
         if embedder_model_api:
             assert use_frozen_embeddings_as_input, "must precompute embeddings w/ api"
-            # Hard-code OpenAI embedding dim
             self.embedder_dim = 1536
             bottleneck_dim = self.embedder_dim
         elif isinstance(embedder, SentenceTransformer):
@@ -99,34 +95,34 @@ class InversionModel(transformers.PreTrainedModel):
         self.use_frozen_embeddings_as_input = use_frozen_embeddings_as_input
         self.bottleneck_dim = bottleneck_dim
 
-        self.embedding_transform = nn.Sequential(
-            nn.Linear(self.embedder_dim, bottleneck_dim),
-            nn.Dropout(self.encoder_decoder.config.dropout_rate),
-            MultiheadAttention(encoder_hidden_dim, num_heads=8, batch_first=True),
-            nn.Linear(bottleneck_dim, encoder_hidden_dim * num_repeat_tokens),
+        # Initialize the MultiheadAttention layer
+        self.attention_layer = MultiheadAttention(
+            embed_dim=encoder_hidden_dim,
+            num_heads=8,
+            batch_first=True
         )
-        if encoder_dropout_disabled:
-            disable_dropout(self.encoder_decoder.encoder)
-        if decoder_dropout_disabled:
-            disable_dropout(self.encoder_decoder.decoder)
-            disable_dropout(self.encoder_decoder.lm_head)
-        ######################################################
+
+        # Initialize linear layers for input and output transformations
+        self.input_linear = nn.Linear(self.embedder_dim, encoder_hidden_dim)
+        self.output_linear = nn.Linear(encoder_hidden_dim, encoder_hidden_dim * num_repeat_tokens)
+
+        # Dropout layer
+        self.dropout = nn.Dropout(self.encoder_decoder.config.dropout_rate)
+
         self.tokenizer = tokenizer
         self.embedder = embedder
         if self.embedder_no_grad:
             for param in self.embedder.parameters():
                 param.requires_grad = False
-
             self.embedder.eval()
 
         self.embedder_tokenizer = embedder_tokenizer
         self.embedder_model_api = embedder_model_api
-        # self.freeze(freeze_strategy=config.freeze_strategy)
         self.embedder_fake_with_zeros = embedder_fake_with_zeros
 
-        self.embedding_transform_strategy = "repeat"  # "none" # "repeat"
+        self.embedding_transform_strategy = "repeat"
         self.embeddings_from_layer_n = embeddings_from_layer_n
-        self.noise_level = vars(config).get("embedder_gaussian_noise_level")
+        self.noise_level = vars(config).get("embedder_gaussian_noise_level") 
 
     def _freeze_encoder(self):
         freeze_params(self.encoder_decoder.encoder)
@@ -244,17 +240,24 @@ class InversionModel(transformers.PreTrainedModel):
             if embeddings.dtype != self.dtype:
                 embeddings = embeddings.to(self.dtype)
 
+            # Transform input embeddings to match attention layer input
+            transformed_input = self.input_linear(embeddings)
+            
+            # Apply dropout
+            transformed_input = self.dropout(transformed_input)
+
+            # Use the same tensor for query, key, and value
             query = key = value = embeddings
 
-            # Apply the attention-based transformation
-            transformed_embeddings, _ = self.embedding_transform[1](query, key, value)
+            # Apply the attention mechanism
+            attention_output, _ = self.attention_layer(query, key, value)
 
-            # Pass through the remaining layers in the Sequential
-            transformed_embeddings = self.embedding_transform[2:](transformed_embeddings)
+            # Transform the output of the attention layer
+            transformed_output = self.output_linear(attention_output)
 
             # Reshape to match the expected output
-            embeddings = transformed_embeddings.reshape(
-                (*transformed_embeddings.shape[:-1], self.num_repeat_tokens, -1)
+            embeddings = transformed_output.reshape(
+                (*transformed_output.shape[:-1], self.num_repeat_tokens, -1)
             )
 
         elif self.embedding_transform_strategy == "nearest_neighbors":
