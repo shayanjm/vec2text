@@ -4,7 +4,7 @@ from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
-from torch.nn import MultiheadAttentio
+from torch.nn import MultiheadAttention
 import transformers
 from sentence_transformers import SentenceTransformer
 
@@ -251,7 +251,7 @@ class InversionModel(transformers.PreTrainedModel):
             embeddings = repeated_embeddings.reshape(
                 (*repeated_embeddings.shape[:-1], self.num_repeat_tokens, -1)
             )
-            
+
         elif self.embedding_transform_strategy == "nearest_neighbors":
             # TODO
             raise NotImplementedError()
