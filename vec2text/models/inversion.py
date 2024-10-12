@@ -246,7 +246,7 @@ class InversionModel(transformers.PreTrainedModel):
             transformed_input = self.dropout(transformed_input)
 
             # Use the same tensor for query, key, and value
-            query = key = value = embeddings
+            query = key = value = transformed_input
 
             # Apply the attention mechanism
             attention_output, _ = self.attention_layer(query, key, value)
