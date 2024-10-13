@@ -287,9 +287,6 @@ class InversionModel(transformers.PreTrainedModel):
             # Add positional embeddings to the input embeddings
             transformed_input = transformed_input + positional_embeddings
 
-            # Ensure transformed_input requires grad
-            transformed_input.requires_grad = True
-
             # Apply Transformer Encoder
             embeddings = self.transformer_encoder(transformed_input)
 
