@@ -344,9 +344,19 @@ class InversionModel(transformers.PreTrainedModel):
             embedder_attention_mask=embedder_attention_mask,
             frozen_embeddings=frozen_embeddings,
         )
-        return self.encoder_decoder(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            labels=labels,
-            decoder_input_ids=decoder_input_ids,
-        )
+
+        # Prepare inputs for encoder_decoder without input_ids
+        encoder_inputs = {
+            "inputs_embeds": inputs_embeds,
+            "attention_mask": attention_mask,
+            "labels": labels,
+            "decoder_input_ids": decoder_input_ids,
+        }
+        # Remove None values
+        encoder_inputs = {k: v for k, v in encoder_inputs.items() if v is not None}
+
+        # Remove input_ids if present
+        if "input_ids" in kwargs:
+            del kwargs["input_ids"]
+
+        return self.encoder_decoder(**encoder_inputs)
