@@ -96,7 +96,7 @@ class InversionModel(transformers.PreTrainedModel):
             nn.Linear(self.embedder_dim, bottleneck_dim),
             nn.TransformerEncoderLayer(
                 d_model=bottleneck_dim,
-                nhead=16,
+                nhead=8,
                 dim_feedforward=encoder_hidden_dim,
                 dropout=self.encoder_decoder.config.dropout_rate,
             ),
