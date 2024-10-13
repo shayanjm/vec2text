@@ -94,13 +94,13 @@ class InversionModel(transformers.PreTrainedModel):
 
         self.embedding_transform = nn.Sequential(
             nn.Linear(self.embedder_dim, bottleneck_dim),
-            nn.GELU(),
             nn.TransformerEncoderLayer(
                 d_model=bottleneck_dim,
                 nhead=8,
                 dim_feedforward=encoder_hidden_dim,
                 dropout=self.encoder_decoder.config.dropout_rate,
             ),
+            nn.LayerNorm(encoder_hidden_dim),
             nn.Linear(bottleneck_dim, encoder_hidden_dim * num_repeat_tokens),
         )
         if encoder_dropout_disabled:
