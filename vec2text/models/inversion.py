@@ -4,8 +4,6 @@ from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.nn import TransformerEncoder, TransformerEncoderLayer
 import transformers
 from sentence_transformers import SentenceTransformer
 
@@ -35,20 +33,14 @@ class InversionModel(transformers.PreTrainedModel):
     encoder_decoder: transformers.AutoModelForSeq2SeqLM
     encoder_decoder_lora: bool  # Whether to use LoRA for the encoder-decoder model
     tokenizer: transformers.PreTrainedTokenizer  # encoder_decoder's tokenizer
-    embedding_transform: (
-        nn.Module
-    )  # Module that transforms embedder output into encoder-decoder input
+    embedding_transform: nn.Module  # Module that transformers embedder output into encoder-decoder input
     bottleneck_dim: int  # Bottleneck dimension for embedding_transform
     num_repeat_tokens: int  # Sequence length for repeating embedder embedding for encoder-decoder input
     embedder_dim: int  # Hidden dimension of embedding model
     embedder_no_grad: bool  # Disable gradients for embedding model
     embedder_fake_with_zeros: bool  # Whether to just provide zeros as input for encoder-decoder (unconditional)
-    embedding_transform_strategy: (
-        str  # Way to transform bottleneck embedding into input for encoder-decoder
-    )
-    use_frozen_embeddings_as_input: (
-        bool  # Whether to train/evaluate on frozen embeddings
-    )
+    embedding_transform_strategy: str  # Way to transform bottleneck embedding into input for encoder-decoder
+    use_frozen_embeddings_as_input: bool  # Whether to train/evaluate on frozen embeddings
     embedded_tokens: torch.Tensor  # used for decoding
     embedder_model_api: Optional[str]
 
@@ -78,8 +70,11 @@ class InversionModel(transformers.PreTrainedModel):
         num_repeat_tokens = config.num_repeat_tokens
         embedder_no_grad = config.embedder_no_grad
 
-        self.encoder_decoder = encoder_decoder
+        self.encoder_decoder = encoder_decoder  # .to_bettertransformer()
+        ######################################################
         self.num_repeat_tokens = num_repeat_tokens
+
+        self.embedder_is_decoder = False
 
         encoder_hidden_dim = self.encoder_decoder.config.hidden_size
         if embedder_model_api:
@@ -97,48 +92,36 @@ class InversionModel(transformers.PreTrainedModel):
         self.use_frozen_embeddings_as_input = use_frozen_embeddings_as_input
         self.bottleneck_dim = bottleneck_dim
 
-        # Initialize the input linear layer to project embeddings to encoder hidden dimension
-        self.input_linear = nn.Linear(self.embedder_dim, encoder_hidden_dim)
-
-        # Initialize the Transformer Encoder Layer
-        self.transformer_encoder_layer = nn.TransformerEncoderLayer(
-            d_model=encoder_hidden_dim,
-            nhead=8,  # Adjust the number of heads as needed
-            dim_feedforward=2048,  # Adjust the feedforward network dimension as needed
-            dropout=self.encoder_decoder.config.dropout_rate,
-            activation="gelu",
-            batch_first=True,
+        self.embedding_transform = nn.Sequential(
+            nn.Linear(self.embedder_dim, bottleneck_dim),
+            nn.TransformerEncoderLayer(
+                d_model=bottleneck_dim,
+                nhead=8,
+                dim_feedforward=encoder_hidden_dim
+                dropout=self.encoder_decoder.config.dropout_rate,
+            )
+            nn.Linear(bottleneck_dim, encoder_hidden_dim * num_repeat_tokens),
         )
-
-        # Initialize the Transformer Encoder
-        self.transformer_encoder = nn.TransformerEncoder(
-            self.transformer_encoder_layer,
-            num_layers=1,  # Adjust the number of layers as needed
-        )
-
-        # **Initialize Positional Embedding Layer**
-        self.positional_embedding = nn.Embedding(
-            self.num_repeat_tokens, encoder_hidden_dim
-        )
-
         if encoder_dropout_disabled:
             disable_dropout(self.encoder_decoder.encoder)
         if decoder_dropout_disabled:
             disable_dropout(self.encoder_decoder.decoder)
             disable_dropout(self.encoder_decoder.lm_head)
-
+        ######################################################
         self.tokenizer = tokenizer
         self.embedder = embedder
         if self.embedder_no_grad:
             for param in self.embedder.parameters():
                 param.requires_grad = False
+
             self.embedder.eval()
 
         self.embedder_tokenizer = embedder_tokenizer
         self.embedder_model_api = embedder_model_api
+        # self.freeze(freeze_strategy=config.freeze_strategy)
         self.embedder_fake_with_zeros = embedder_fake_with_zeros
 
-        self.embedding_transform_strategy = "repeat"
+        self.embedding_transform_strategy = "repeat"  # "none" # "repeat"
         self.embeddings_from_layer_n = embeddings_from_layer_n
         self.noise_level = vars(config).get("embedder_gaussian_noise_level")
 
@@ -146,6 +129,7 @@ class InversionModel(transformers.PreTrainedModel):
         freeze_params(self.encoder_decoder.encoder)
 
     def _freeze_decoder(self):
+        # github.com/huggingface/transformers/blob/master/src/transformers/models/t5/modeling_t5.py#L1229-L1231
         freeze_params(self.encoder_decoder.decoder)
         freeze_params(self.encoder_decoder.lm_head)
 
@@ -159,6 +143,7 @@ class InversionModel(transformers.PreTrainedModel):
         elif freeze_strategy == "encoder_and_decoder":
             self._freeze_encoder()
             self._freeze_decoder()
+            # in this case, freeze embeddings too
             freeze_params(self.encoder_decoder.shared)
         elif freeze_strategy == "none":
             pass
@@ -193,8 +178,10 @@ class InversionModel(transformers.PreTrainedModel):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         token_type_ids: Optional[torch.Tensor] = None,
+        # token_type_ids: Optional[torch.Tensor] = None, # not used
     ) -> torch.Tensor:
         embedder = self.embedder
+        # print("** call_embedding_model")
         if self.embedder_no_grad:
             embedder.eval()
 
@@ -212,6 +199,7 @@ class InversionModel(transformers.PreTrainedModel):
                 api_name=self.embedder_model_api,
             )
         elif isinstance(self.embedder, SentenceTransformer):
+            # sentence-transformers is kind of really annoying
             model_inputs = {"input_ids": input_ids, "attention_mask": attention_mask}
             if token_type_ids is not None:
                 model_inputs["token_type_ids"] = token_type_ids
@@ -233,6 +221,7 @@ class InversionModel(transformers.PreTrainedModel):
         embedder_attention_mask: Optional[torch.Tensor],
         frozen_embeddings: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # print("** embed_and_project")
         assert not ((embedder_input_ids is None) and (frozen_embeddings is None))
         if frozen_embeddings is not None:
             embeddings = frozen_embeddings
@@ -248,48 +237,14 @@ class InversionModel(transformers.PreTrainedModel):
                 input_ids=embedder_input_ids,
                 attention_mask=embedder_attention_mask,
             )
-
         if self.embedding_transform_strategy == "repeat":
             if embeddings.dtype != self.dtype:
                 embeddings = embeddings.to(self.dtype)
-
-            # Input Linear Layer
-            transformed_input = self.input_linear(
-                embeddings
-            )  # [batch_size, encoder_hidden_dim]
-
-            # Optional Dropout
-            transformed_input = F.dropout(
-                transformed_input,
-                p=self.encoder_decoder.config.dropout_rate,
-                training=self.training,
+            repeated_embeddings = self.embedding_transform(embeddings)
+            # linear outputs a big embedding, reshape into a sequence of regular size embeddings.
+            embeddings = repeated_embeddings.reshape(
+                (*repeated_embeddings.shape[:-1], self.num_repeat_tokens, -1)
             )
-
-            # Expand to Sequence Length
-            transformed_input = transformed_input.unsqueeze(1).repeat(
-                1, self.num_repeat_tokens, 1
-            )  # [batch_size, num_repeat_tokens, encoder_hidden_dim]
-
-            # Add Positional Encodings
-            position_ids = torch.arange(
-                self.num_repeat_tokens,
-                dtype=torch.long,
-                device=transformed_input.device,
-            )
-            position_ids = position_ids.unsqueeze(0).expand(
-                transformed_input.size(0), -1
-            )  # [batch_size, num_repeat_tokens]
-
-            positional_embeddings = self.positional_embedding(
-                position_ids
-            )  # [batch_size, num_repeat_tokens, encoder_hidden_dim]
-
-            # Add positional embeddings to the input embeddings
-            transformed_input = transformed_input + positional_embeddings
-
-            # Apply Transformer Encoder
-            embeddings = self.transformer_encoder(transformed_input)
-
         elif self.embedding_transform_strategy == "nearest_neighbors":
             # TODO
             raise NotImplementedError()
@@ -297,11 +252,9 @@ class InversionModel(transformers.PreTrainedModel):
             raise ValueError(
                 f"unknown embedding transformation strategy {self.embedding_transform_strategy}"
             )
-
         attention_mask = torch.ones(
             (embeddings.shape[0], embeddings.shape[1]), device=embeddings.device
         )
-
         return embeddings, attention_mask
 
     def generate(
@@ -318,15 +271,24 @@ class InversionModel(transformers.PreTrainedModel):
 
         if "decoder_input_ids" in inputs:
             return self.encoder_decoder.generate(
+                # required: input embeddings
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
+                # optional: input IDs (for starting generation).
+                # typically not set unless generating prefixes for
+                # reranking.
                 decoder_input_ids=inputs["decoder_input_ids"],
+                # decoder_attention_mask=inputs["decoder_attention_mask"],
                 **generation_kwargs,
             )
         else:
             return self.encoder_decoder.generate(
+                # required: input embeddings
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
+                # optional: input IDs (for starting generation).
+                # typically not set unless generating prefixes for
+                # reranking.
                 **generation_kwargs,
             )
 
@@ -339,24 +301,15 @@ class InversionModel(transformers.PreTrainedModel):
         decoder_input_ids: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Dict[str, torch.Tensor]:
+        # Unused: input_ids, attention_mask
         inputs_embeds, attention_mask = self.embed_and_project(
             embedder_input_ids=embedder_input_ids,
             embedder_attention_mask=embedder_attention_mask,
             frozen_embeddings=frozen_embeddings,
         )
-
-        # Prepare inputs for encoder_decoder without input_ids
-        encoder_inputs = {
-            "inputs_embeds": inputs_embeds,
-            "attention_mask": attention_mask,
-            "labels": labels,
-            "decoder_input_ids": decoder_input_ids,
-        }
-        # Remove None values
-        encoder_inputs = {k: v for k, v in encoder_inputs.items() if v is not None}
-
-        # Remove input_ids if present
-        if "input_ids" in kwargs:
-            del kwargs["input_ids"]
-
-        return self.encoder_decoder(**encoder_inputs)
+        return self.encoder_decoder(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            labels=labels,
+            decoder_input_ids=decoder_input_ids,
+        )
