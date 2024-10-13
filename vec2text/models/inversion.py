@@ -100,7 +100,7 @@ class InversionModel(transformers.PreTrainedModel):
                 dim_feedforward=encoder_hidden_dim,
                 dropout=self.encoder_decoder.config.dropout_rate,
             ),
-            nn.LayerNorm(encoder_hidden_dim),
+            nn.LayerNorm(bottleneck_dim),
             nn.Linear(bottleneck_dim, encoder_hidden_dim * num_repeat_tokens),
         )
         if encoder_dropout_disabled:
