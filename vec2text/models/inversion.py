@@ -253,27 +253,28 @@ class InversionModel(transformers.PreTrainedModel):
             if embeddings.dtype != self.dtype:
                 embeddings = embeddings.to(self.dtype)
 
-            # **Input Linear Layer**
-            # Project embeddings to match encoder hidden dimension
+            # Input Linear Layer
             transformed_input = self.input_linear(
                 embeddings
             )  # [batch_size, encoder_hidden_dim]
 
-            # **Optional Dropout**
+            # Optional Dropout
             transformed_input = F.dropout(
                 transformed_input,
                 p=self.encoder_decoder.config.dropout_rate,
                 training=self.training,
             )
 
-            # **Expand to Sequence Length**
+            # Expand to Sequence Length
             transformed_input = transformed_input.unsqueeze(1).repeat(
                 1, self.num_repeat_tokens, 1
             )  # [batch_size, num_repeat_tokens, encoder_hidden_dim]
 
-            # **Add Positional Encodings**
+            # Add Positional Encodings
             position_ids = torch.arange(
-                self.num_repeat_tokens, dtype=torch.long, device=embeddings.device
+                self.num_repeat_tokens,
+                dtype=torch.long,
+                device=transformed_input.device,
             )
             position_ids = position_ids.unsqueeze(0).expand(
                 transformed_input.size(0), -1
@@ -286,7 +287,10 @@ class InversionModel(transformers.PreTrainedModel):
             # Add positional embeddings to the input embeddings
             transformed_input = transformed_input + positional_embeddings
 
-            # **Apply Transformer Encoder**
+            # Ensure transformed_input requires grad
+            transformed_input.requires_grad = True
+
+            # Apply Transformer Encoder
             embeddings = self.transformer_encoder(transformed_input)
 
         elif self.embedding_transform_strategy == "nearest_neighbors":
