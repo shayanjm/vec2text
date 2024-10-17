@@ -12,10 +12,58 @@ class InversionTrainer(BaseTrainer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         ######################################################
+        self.model.log_var_ce = nn.Parameter(torch.zeros(()))
+        self.model.log_var_embedding = nn.Parameter(torch.zeros(()))
         self.tokenizer = self.model.tokenizer
         self.embedder_tokenizer = self.model.embedder_tokenizer
         self.call_embedding_model = self.model.call_embedding_model
         self.embedder = self.model.embedder
+    
+    def compute_loss(self, model, inputs, return_outputs=False):
+        # Forward pass
+        outputs = model(**inputs)
+        logits = outputs.get("logits")
+
+        # Compute Cross-Entropy Loss
+        labels = inputs.get("labels")
+        loss_fct = nn.CrossEntropyLoss(ignore_index=self.tokenizer.pad_token_id)
+        ce_loss = loss_fct(logits.view(-1, logits.size(-1)), labels.view(-1))
+
+        # Get Predicted Tokens
+        pred_ids = torch.argmax(logits, dim=-1)
+
+        # Decode Predicted Tokens to Text
+        pred_texts = self.tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
+
+        # Tokenize predicted texts using embedder_tokenizer
+        pred_inputs = self.embedder_tokenizer(
+            pred_texts,
+            return_tensors='pt',
+            padding=True,
+            truncation=True,
+            max_length=self.embedder_tokenizer.model_max_length,
+        ).to(logits.device)
+
+        # Use call_embedding_model to get embeddings of predicted texts
+        pred_embeddings = self.call_embedding_model(
+            input_ids=pred_inputs['input_ids'],
+            attention_mask=pred_inputs['attention_mask'],
+        )
+
+        # Get Target Embeddings
+        target_embeddings = inputs['frozen_embeddings']
+
+        # Compute Embedding Distance (e.g., Mean Squared Error)
+        embedding_loss = nn.functional.mse_loss(pred_embeddings, target_embeddings)
+
+        # Compute total loss with uncertainty weighting
+        precision_ce = torch.exp(-model.log_var_ce)
+        precision_embedding = torch.exp(-model.log_var_embedding)
+
+        total_loss = (precision_ce * ce_loss + model.log_var_ce) + \
+                     (precision_embedding * embedding_loss + model.log_var_embedding)
+
+        return (total_loss, outputs) if return_outputs else total_loss
 
     def generate(self, inputs: Dict, generation_kwargs: Dict) -> torch.Tensor:
         return self.model.generate(inputs=inputs, generation_kwargs=generation_kwargs)
