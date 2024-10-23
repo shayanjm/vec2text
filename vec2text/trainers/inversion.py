@@ -12,19 +12,21 @@ class InversionTrainer(BaseTrainer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         ######################################################
-        self.model.log_var_ce = nn.Parameter(torch.zeros(()))
-        self.model.log_var_embedding = nn.Parameter(torch.zeros(()))
         self.tokenizer = self.model.tokenizer
         self.embedder_tokenizer = self.model.embedder_tokenizer
         self.call_embedding_model = self.model.call_embedding_model
         self.embedder = self.model.embedder
+
+        # Initialize learnable log variances for each loss
+        self.log_var_ce = nn.Parameter(torch.zeros(()))
+        self.log_var_embedding = nn.Parameter(torch.zeros(()))
     
     def compute_loss(self, model, inputs, return_outputs=False):
         # Forward pass
         outputs = model(**inputs)
         logits = outputs.get("logits")
 
-        # Compute Cross-Entropy Loss
+        # Compute Typical Cross-Entropy Loss
         labels = inputs.get("labels")
         loss_fct = nn.CrossEntropyLoss(ignore_index=self.tokenizer.pad_token_id)
         ce_loss = loss_fct(logits.view(-1, logits.size(-1)), labels.view(-1))
