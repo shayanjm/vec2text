@@ -18,21 +18,19 @@ class InversionTrainer(BaseTrainer):
         self.embedder = self.model.embedder
 
     def compute_loss(self, model, inputs, return_outputs=False):
-        # Forward pass with labels to compute cross-entropy loss internally
+        # Forward pass
         outputs = model(**inputs)
         ce_loss = outputs.loss  # Cross-entropy loss computed by the model
 
-        # Get logits for generating predicted tokens
-        logits = outputs.logits  # Shape: (batch_size, sequence_length, vocab_size)
+        logits = outputs.get("logits")  # Shape: (batch_size, sequence_length, vocab_size)
 
         # Get Predicted Tokens
-        pred_ids = torch.argmax(logits, dim=-1)  # Shape: (batch_size, sequence_length)
+        pred_ids = torch.argmax(logits, dim=-1)
 
-        # Move pred_ids to CPU and convert to list
-        pred_ids_cpu = pred_ids.detach().cpu().tolist()
+        pred_ids = pred_ids.detach().cpu()
 
         # Decode Predicted Tokens to Text
-        pred_texts = self.tokenizer.batch_decode(pred_ids_cpu, skip_special_tokens=True)
+        pred_texts = self.tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
 
         # Tokenize predicted texts using embedder_tokenizer
         pred_inputs = self.embedder_tokenizer(
@@ -55,10 +53,22 @@ class InversionTrainer(BaseTrainer):
         # Compute Embedding Distance (e.g., Mean Squared Error)
         embedding_loss = nn.functional.mse_loss(pred_embeddings, target_embeddings)
 
-        # Total Loss: Combine CE loss and embedding loss
-        total_loss = ce_loss + self.embedding_loss_weight * embedding_loss
+        # Access log_var_ce and log_var_embedding via model.module if necessary
+        if isinstance(model, torch.nn.DataParallel) or isinstance(model, torch.nn.parallel.DistributedDataParallel):
+            log_var_ce = model.module.log_var_ce
+            log_var_embedding = model.module.log_var_embedding
+        else:
+            log_var_ce = model.log_var_ce
+            log_var_embedding = model.log_var_embedding
 
-        return (total_loss, outputs) if return_outputs else total_loss 
+        # Compute total loss with uncertainty weighting
+        precision_ce = torch.exp(-log_var_ce)
+        precision_embedding = torch.exp(-log_var_embedding)
+
+        total_loss = (precision_ce * ce_loss + log_var_ce) + \
+                        (precision_embedding * embedding_loss + log_var_embedding)
+
+        return (total_loss, outputs) if return_outputs else total_loss
  
 
     def generate(self, inputs: Dict, generation_kwargs: Dict) -> torch.Tensor:
