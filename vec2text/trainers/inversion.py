@@ -30,6 +30,13 @@ class InversionTrainer(BaseTrainer):
         # Get Predicted Tokens
         pred_ids = torch.argmax(logits, dim=-1)
 
+        # Debugging: Check for invalid token IDs
+        vocab_size = self.tokenizer.vocab_size
+        if torch.any(pred_ids < 0) or torch.any(pred_ids >= vocab_size):
+            print(f"Invalid token IDs detected. Min ID: {pred_ids.min()}, Max ID: {pred_ids.max()}, Vocab Size: {vocab_size}")
+
+        pred_ids = pred_ids.detach().cpu()
+
         # Decode Predicted Tokens to Text
         pred_texts = self.tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
 
