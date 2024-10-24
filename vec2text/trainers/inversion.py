@@ -54,14 +54,23 @@ class InversionTrainer(BaseTrainer):
         # Compute Embedding Distance (e.g., Mean Squared Error)
         embedding_loss = nn.functional.mse_loss(pred_embeddings, target_embeddings)
 
-        # Compute total loss with uncertainty weighting
-        precision_ce = torch.exp(-model.log_var_ce)
-        precision_embedding = torch.exp(-model.log_var_embedding)
+        # Access log_var_ce and log_var_embedding via model.module if necessary
+        if isinstance(model, torch.nn.DataParallel) or isinstance(model, torch.nn.parallel.DistributedDataParallel):
+            log_var_ce = model.module.log_var_ce
+            log_var_embedding = model.module.log_var_embedding
+        else:
+            log_var_ce = model.log_var_ce
+            log_var_embedding = model.log_var_embedding
 
-        total_loss = (precision_ce * ce_loss + model.log_var_ce) + \
-                     (precision_embedding * embedding_loss + model.log_var_embedding)
+        # Compute total loss with uncertainty weighting
+        precision_ce = torch.exp(-log_var_ce)
+        precision_embedding = torch.exp(-log_var_embedding)
+
+        total_loss = (precision_ce * ce_loss + log_var_ce) + \
+                        (precision_embedding * embedding_loss + log_var_embedding)
 
         return (total_loss, outputs) if return_outputs else total_loss
+ 
 
     def generate(self, inputs: Dict, generation_kwargs: Dict) -> torch.Tensor:
         return self.model.generate(inputs=inputs, generation_kwargs=generation_kwargs)
