@@ -18,54 +18,21 @@ class InversionTrainer(BaseTrainer):
         self.embedder = self.model.embedder
 
     def compute_loss(self, model, inputs, return_outputs=False):
-        # Forward pass
+        # Forward pass with labels to compute cross-entropy loss internally
         outputs = model(**inputs)
-        logits = outputs.get("logits")  # Shape: (batch_size, sequence_length, vocab_size)
+        ce_loss = outputs.loss  # Cross-entropy loss computed by the model
 
-        # Compute Typical Cross-Entropy Loss
-        labels = inputs.get("labels")  # Shape: (batch_size, sequence_length)
-        if labels is None:
-            raise ValueError("Labels are missing from inputs.")
-
-        # Ensure labels are of type LongTensor
-        if labels.dtype != torch.long:
-            labels = labels.long()
-
-        # Ensure labels are on the same device as logits
-        labels = labels.to(logits.device)
-
-        # Check for invalid label values
-        vocab_size = self.tokenizer.vocab_size
-        pad_token_id = self.tokenizer.pad_token_id
-        
-        # Exclude pad_token_id from validity check if using ignore_index
-        valid_label_mask = labels != pad_token_id
-        invalid_labels = labels[valid_label_mask][(labels[valid_label_mask] < 0) | (labels[valid_label_mask] >= vocab_size)]
-        if invalid_labels.numel() > 0:
-            min_label = invalid_labels.min().item()
-            max_label = invalid_labels.max().item()
-            print(f"Invalid label IDs detected. Min label: {min_label}, Max label: {max_label}, Vocab Size: {vocab_size}")
-            raise ValueError("Labels contain invalid IDs.")
-
-        if labels.shape != logits.shape[:-1]:
-            print(f"Labels shape: {labels.shape}, Logits shape: {logits.shape}")
-            raise ValueError("Labels and logits have mismatched shapes.")
-
-        loss_fct = nn.CrossEntropyLoss(ignore_index=pad_token_id)
-        ce_loss = loss_fct(logits.view(-1, logits.size(-1)), labels.view(-1))
+        # Get logits for generating predicted tokens
+        logits = outputs.logits  # Shape: (batch_size, sequence_length, vocab_size)
 
         # Get Predicted Tokens
-        pred_ids = torch.argmax(logits, dim=-1)
+        pred_ids = torch.argmax(logits, dim=-1)  # Shape: (batch_size, sequence_length)
 
-        # Debugging: Check for invalid token IDs
-        vocab_size = self.tokenizer.vocab_size
-        if torch.any(pred_ids < 0) or torch.any(pred_ids >= vocab_size):
-            print(f"Invalid token IDs detected. Min ID: {pred_ids.min()}, Max ID: {pred_ids.max()}, Vocab Size: {vocab_size}")
-
-        pred_ids = pred_ids.detach().cpu()
+        # Move pred_ids to CPU and convert to list
+        pred_ids_cpu = pred_ids.detach().cpu().tolist()
 
         # Decode Predicted Tokens to Text
-        pred_texts = self.tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
+        pred_texts = self.tokenizer.batch_decode(pred_ids_cpu, skip_special_tokens=True)
 
         # Tokenize predicted texts using embedder_tokenizer
         pred_inputs = self.embedder_tokenizer(
@@ -88,22 +55,10 @@ class InversionTrainer(BaseTrainer):
         # Compute Embedding Distance (e.g., Mean Squared Error)
         embedding_loss = nn.functional.mse_loss(pred_embeddings, target_embeddings)
 
-        # Access log_var_ce and log_var_embedding via model.module if necessary
-        if isinstance(model, torch.nn.DataParallel) or isinstance(model, torch.nn.parallel.DistributedDataParallel):
-            log_var_ce = model.module.log_var_ce
-            log_var_embedding = model.module.log_var_embedding
-        else:
-            log_var_ce = model.log_var_ce
-            log_var_embedding = model.log_var_embedding
+        # Total Loss: Combine CE loss and embedding loss
+        total_loss = ce_loss + self.embedding_loss_weight * embedding_loss
 
-        # Compute total loss with uncertainty weighting
-        precision_ce = torch.exp(-log_var_ce)
-        precision_embedding = torch.exp(-log_var_embedding)
-
-        total_loss = (precision_ce * ce_loss + log_var_ce) + \
-                        (precision_embedding * embedding_loss + log_var_embedding)
-
-        return (total_loss, outputs) if return_outputs else total_loss
+        return (total_loss, outputs) if return_outputs else total_loss 
  
 
     def generate(self, inputs: Dict, generation_kwargs: Dict) -> torch.Tensor:
