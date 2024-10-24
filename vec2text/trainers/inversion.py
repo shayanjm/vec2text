@@ -17,10 +17,6 @@ class InversionTrainer(BaseTrainer):
         self.call_embedding_model = self.model.call_embedding_model
         self.embedder = self.model.embedder
 
-        # Initialize learnable log variances for each loss
-        self.log_var_ce = nn.Parameter(torch.zeros(()))
-        self.log_var_embedding = nn.Parameter(torch.zeros(()))
-    
     def compute_loss(self, model, inputs, return_outputs=False):
         # Forward pass
         outputs = model(**inputs)

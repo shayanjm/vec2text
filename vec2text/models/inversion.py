@@ -43,7 +43,7 @@ class InversionModel(transformers.PreTrainedModel):
     use_frozen_embeddings_as_input: bool  # Whether to train/evaluate on frozen embeddings
     embedded_tokens: torch.Tensor  # used for decoding
     embedder_model_api: Optional[str]
-
+    
     def __init__(self, config: InversionConfig):
         super().__init__(config=config)
 
@@ -120,6 +120,10 @@ class InversionModel(transformers.PreTrainedModel):
         self.embedding_transform_strategy = "repeat"  # "none" # "repeat"
         self.embeddings_from_layer_n = embeddings_from_layer_n
         self.noise_level = vars(config).get("embedder_gaussian_noise_level")
+
+        # Initialize learnable log variances for each loss
+        self.log_var_ce = nn.Parameter(torch.zeros(()))
+        self.log_var_embedding = nn.Parameter(torch.zeros(()))
 
     def _freeze_encoder(self):
         freeze_params(self.encoder_decoder.encoder)
