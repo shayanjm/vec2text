@@ -20,11 +20,38 @@ class InversionTrainer(BaseTrainer):
     def compute_loss(self, model, inputs, return_outputs=False):
         # Forward pass
         outputs = model(**inputs)
-        logits = outputs.get("logits")
+        logits = outputs.get("logits")  # Shape: (batch_size, sequence_length, vocab_size)
 
         # Compute Typical Cross-Entropy Loss
-        labels = inputs.get("labels")
-        loss_fct = nn.CrossEntropyLoss(ignore_index=self.tokenizer.pad_token_id)
+        labels = inputs.get("labels")  # Shape: (batch_size, sequence_length)
+        if labels is None:
+            raise ValueError("Labels are missing from inputs.")
+
+        # Ensure labels are of type LongTensor
+        if labels.dtype != torch.long:
+            labels = labels.long()
+
+        # Ensure labels are on the same device as logits
+        labels = labels.to(logits.device)
+
+        # Check for invalid label values
+        vocab_size = self.tokenizer.vocab_size
+        pad_token_id = self.tokenizer.pad_token_id
+        
+        # Exclude pad_token_id from validity check if using ignore_index
+        valid_label_mask = labels != pad_token_id
+        invalid_labels = labels[valid_label_mask][(labels[valid_label_mask] < 0) | (labels[valid_label_mask] >= vocab_size)]
+        if invalid_labels.numel() > 0:
+            min_label = invalid_labels.min().item()
+            max_label = invalid_labels.max().item()
+            print(f"Invalid label IDs detected. Min label: {min_label}, Max label: {max_label}, Vocab Size: {vocab_size}")
+            raise ValueError("Labels contain invalid IDs.")
+
+        if labels.shape != logits.shape[:-1]:
+            print(f"Labels shape: {labels.shape}, Logits shape: {logits.shape}")
+            raise ValueError("Labels and logits have mismatched shapes.")
+
+        loss_fct = nn.CrossEntropyLoss(ignore_index=pad_token_id)
         ce_loss = loss_fct(logits.view(-1, logits.size(-1)), labels.view(-1))
 
         # Get Predicted Tokens
