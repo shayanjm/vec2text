@@ -42,7 +42,7 @@ class InversionTrainer(BaseTrainer):
         total_loss = precision_ce * ce_loss + log_var_ce
 
         # Compute embedding loss only at intervals
-        if (self.global_step + 1) % self.embedding_loss_interval == 0:
+        if (self.state.global_step + 1) % self.embedding_loss_interval == 0:
             logits = outputs.get("logits")  # Shape: (batch_size, sequence_length, vocab_size)
             pred_ids = torch.argmax(logits, dim=-1)
             pred_ids = pred_ids.detach().cpu()
