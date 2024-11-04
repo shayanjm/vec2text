@@ -10,10 +10,13 @@ from vec2text.trainers.base import BaseTrainer
 
 
 class InversionTrainer(BaseTrainer):
-    def __init__(self, *args, max_cache_size=10000, **kwargs):
+    def __init__(self, *args, max_cache_size=10000, embedding_loss_interval=100, **kwargs):
         super().__init__(*args, **kwargs)
-        # New parameter: maximum cache size
+        # New parameters: maximum cache size and embedding loss interval
         self.max_cache_size = max_cache_size
+        self.embedding_loss_interval = embedding_loss_interval
+        self.embedding_loss_accumulator = 0.0  # Initialize embedding loss accumulator
+        self.embedding_loss_count = 0  # Track number of accumulated steps
         # Initialize cache using OrderedDict for LRU functionality
         self.embedding_cache = OrderedDict()
         # Existing initializations
@@ -38,58 +41,67 @@ class InversionTrainer(BaseTrainer):
         precision_ce = torch.exp(-log_var_ce)
         total_loss = precision_ce * ce_loss + log_var_ce
 
-        # Compute embedding loss every time
-        logits = outputs.get("logits")  # Shape: (batch_size, sequence_length, vocab_size)
-        pred_ids = torch.argmax(logits, dim=-1)
-        pred_ids = pred_ids.detach().cpu()
+        # Compute embedding loss only at intervals
+        if (self.global_step + 1) % self.embedding_loss_interval == 0:
+            logits = outputs.get("logits")  # Shape: (batch_size, sequence_length, vocab_size)
+            pred_ids = torch.argmax(logits, dim=-1)
+            pred_ids = pred_ids.detach().cpu()
 
-        # Decode Predicted Tokens to Text
-        pred_texts = self.tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
+            # Decode Predicted Tokens to Text
+            pred_texts = self.tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
 
-        # Initialize list for embeddings
-        embeddings_list = []
-        for text in pred_texts:
-            if text in self.embedding_cache:
-                # Retrieve from cache and move to device
-                pred_embedding = self.embedding_cache[text].to(ce_loss.device)
-            else:
-                # Tokenize and compute embedding
-                pred_inputs = self.embedder_tokenizer(
-                    [text],
-                    return_tensors='pt',
-                    padding=True,
-                    truncation=True,
-                    max_length=self.embedder_tokenizer.model_max_length,
-                ).to(ce_loss.device)
-                pred_embedding = self.call_embedding_model(
-                    input_ids=pred_inputs['input_ids'],
-                    attention_mask=pred_inputs['attention_mask'],
-                )
-                # Store in cache and enforce max cache size
-                self.embedding_cache[text] = pred_embedding.detach().cpu()
-                if len(self.embedding_cache) > self.max_cache_size:
-                    # Remove oldest item
-                    self.embedding_cache.popitem(last=False)
-            embeddings_list.append(pred_embedding)
+            # Initialize list for embeddings
+            embeddings_list = []
+            for text in pred_texts:
+                if text in self.embedding_cache:
+                    # Retrieve from cache and move to device
+                    pred_embedding = self.embedding_cache[text].to(ce_loss.device)
+                else:
+                    # Tokenize and compute embedding
+                    pred_inputs = self.embedder_tokenizer(
+                        [text],
+                        return_tensors='pt',
+                        padding=True,
+                        truncation=True,
+                        max_length=self.embedder_tokenizer.model_max_length,
+                    ).to(ce_loss.device)
+                    pred_embedding = self.call_embedding_model(
+                        input_ids=pred_inputs['input_ids'],
+                        attention_mask=pred_inputs['attention_mask'],
+                    )
+                    # Store in cache and enforce max cache size
+                    self.embedding_cache[text] = pred_embedding.detach().cpu()
+                    if len(self.embedding_cache) > self.max_cache_size:
+                        # Remove oldest item
+                        self.embedding_cache.popitem(last=False)
+                embeddings_list.append(pred_embedding)
 
-        # Stack embeddings
-        pred_embeddings = torch.cat(embeddings_list, dim=0)
+            # Stack embeddings
+            pred_embeddings = torch.cat(embeddings_list, dim=0)
 
-        # Get Target Embeddings
-        target_embeddings = inputs['frozen_embeddings']
+            # Get Target Embeddings
+            target_embeddings = inputs['frozen_embeddings']
 
-        # Ensure the shapes match
-        if pred_embeddings.shape != target_embeddings.shape:
-            # Adjust shapes if necessary
-            pred_embeddings = pred_embeddings.view_as(target_embeddings)
+            # Ensure the shapes match
+            if pred_embeddings.shape != target_embeddings.shape:
+                # Adjust shapes if necessary
+                pred_embeddings = pred_embeddings.view_as(target_embeddings)
 
-        # Compute Embedding Distance (e.g., Mean Squared Error)
-        embedding_loss = nn.functional.mse_loss(pred_embeddings, target_embeddings)
+            # Compute Embedding Distance (e.g., Mean Squared Error)
+            embedding_loss = nn.functional.mse_loss(pred_embeddings, target_embeddings)
+            self.embedding_loss_accumulator += embedding_loss
+            self.embedding_loss_count += 1
 
-        precision_embedding = torch.exp(-log_var_embedding)
-        total_loss += precision_embedding * embedding_loss + log_var_embedding
+            # Compute average embedding loss and add to total loss
+            avg_embedding_loss = self.embedding_loss_accumulator / self.embedding_loss_count
+            precision_embedding = torch.exp(-log_var_embedding)
+            total_loss += precision_embedding * avg_embedding_loss + log_var_embedding
 
-        return (total_loss, outputs) if return_outputs else total_loss
+            # Reset the accumulator and count
+            self.embedding_loss_accumulator = 0.0
+            self.embedding_loss_count = 0
+
+        return (total_loss, outputs) if return_outputs else total_loss 
 
     def generate(self, inputs: Dict, generation_kwargs: Dict) -> torch.Tensor:
         return self.model.generate(inputs=inputs, generation_kwargs=generation_kwargs)
