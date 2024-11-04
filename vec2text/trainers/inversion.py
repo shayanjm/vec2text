@@ -38,10 +38,17 @@ class InversionTrainer(BaseTrainer):
             log_var_ce = model.log_var_ce
             log_var_embedding = model.log_var_embedding
 
+        # Compute precisions
         precision_ce = torch.exp(-log_var_ce)
+        precision_embedding = torch.exp(-log_var_embedding)
+
+        # Compute total loss with cross-entropy loss components
         total_loss = precision_ce * ce_loss + log_var_ce
 
-        # Compute embedding loss only at intervals
+        # Initialize embedding loss to zero
+        embedding_loss = torch.tensor(0.0, device=ce_loss.device)
+
+        # Compute embedding loss only at specified intervals
         if (self.state.global_step + 1) % self.embedding_loss_interval == 0:
             logits = outputs.get("logits")  # Shape: (batch_size, sequence_length, vocab_size)
             pred_ids = torch.argmax(logits, dim=-1)
@@ -89,19 +96,16 @@ class InversionTrainer(BaseTrainer):
 
             # Compute Embedding Distance (e.g., Mean Squared Error)
             embedding_loss = nn.functional.mse_loss(pred_embeddings, target_embeddings)
-            self.embedding_loss_accumulator += embedding_loss
-            self.embedding_loss_count += 1
-
-            # Compute average embedding loss and add to total loss
-            avg_embedding_loss = self.embedding_loss_accumulator / self.embedding_loss_count
-            precision_embedding = torch.exp(-log_var_embedding)
-            total_loss += precision_embedding * avg_embedding_loss + log_var_embedding
 
             # Reset the accumulator and count
             self.embedding_loss_accumulator = 0.0
             self.embedding_loss_count = 0
 
-        return (total_loss, outputs) if return_outputs else total_loss 
+        # Even if embedding_loss is zero, include it in total_loss
+        total_loss += precision_embedding * embedding_loss + log_var_embedding
+
+        return (total_loss, outputs) if return_outputs else total_loss
+ 
 
     def generate(self, inputs: Dict, generation_kwargs: Dict) -> torch.Tensor:
         return self.model.generate(inputs=inputs, generation_kwargs=generation_kwargs)
