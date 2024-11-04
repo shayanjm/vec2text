@@ -102,7 +102,9 @@ class InversionTrainer(BaseTrainer):
             # Reset the accumulator and count
             self.embedding_loss_accumulator = 0.0
             self.embedding_loss_count = 0
-
+        
+        logger.info(f"precision_ce: {precision_ce} || ce_loss: {ce_loss} || log_var_ce: {log_var_ce}")
+        logger.info(f"precision_embedding: {precision_embedding} || embedding_loss: {embedding_loss} || log_var_embedding: {log_var_embedding}")
         # Even if embedding_loss is zero, include it in total_loss
         total_loss += precision_embedding * embedding_loss + log_var_embedding
 
