@@ -9,7 +9,7 @@ import transformers
 from vec2text.trainers.base import BaseTrainer
 
 class InversionTrainer(BaseTrainer):
-    def __init__(self, *args, max_cache_size=10000, embedding_loss_interval=200, **kwargs):
+    def __init__(self, *args, max_cache_size=10000, embedding_loss_interval=25, **kwargs):
         super().__init__(*args, **kwargs)
         # New parameters: maximum cache size and embedding loss interval
         self.max_cache_size = max_cache_size
@@ -101,6 +101,15 @@ class InversionTrainer(BaseTrainer):
         
         # Even if embedding_loss is zero, include it in total_loss
         total_loss += precision_embedding * embedding_loss + log_var_embedding
+        
+        # Attach variables to outputs
+        outputs.ce_loss = ce_loss.detach()
+        outputs.embedding_loss = embedding_loss.detach()
+        outputs.log_var_ce = log_var_ce.detach()
+        outputs.log_var_embedding = log_var_embedding.detach()
+        outputs.precision_ce = precision_ce.detach()
+        outputs.precision_embedding = precision_embedding.detach()
+        outputs.total_loss = total_loss.detach()
 
         return (total_loss, outputs) if return_outputs else total_loss
  
@@ -116,6 +125,18 @@ class InversionTrainer(BaseTrainer):
         """
         # TODO: Log training metrics from below... (How to do with huggingface?)
         self._compute_data_metrics(inputs=inputs)
+        
+        # Log the variables to wandb
+        self.log({
+            'ce_loss': outputs.ce_loss.item(),
+            'embedding_loss': outputs.embedding_loss.item(),
+            'log_var_ce': outputs.log_var_ce.item(),
+            'log_var_embedding': outputs.log_var_embedding.item(),
+            'precision_ce': outputs.precision_ce.item(),
+            'precision_embedding': outputs.precision_embedding.item(),
+            'total_loss': loss.item()
+        })
+
         # self.log({ f"train/{k}": v for k,v in metrics.items() })
         return super().training_step(model, inputs)
 
