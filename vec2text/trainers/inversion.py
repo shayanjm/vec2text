@@ -1,5 +1,4 @@
 import math
-import logging
 from typing import Dict
 from collections import OrderedDict
 
@@ -9,10 +8,8 @@ import transformers
 
 from vec2text.trainers.base import BaseTrainer
 
-logger = logging.getLogger(__name__)
-
 class InversionTrainer(BaseTrainer):
-    def __init__(self, *args, max_cache_size=10000, embedding_loss_interval=100, **kwargs):
+    def __init__(self, *args, max_cache_size=10000, embedding_loss_interval=200, **kwargs):
         super().__init__(*args, **kwargs)
         # New parameters: maximum cache size and embedding loss interval
         self.max_cache_size = max_cache_size
@@ -98,13 +95,10 @@ class InversionTrainer(BaseTrainer):
 
             # Compute Embedding Distance (e.g., Mean Squared Error)
             embedding_loss = nn.functional.mse_loss(pred_embeddings, target_embeddings)
-            logger.info(f"Embedding Loss: {embedding_loss.item()}")
             # Reset the accumulator and count
             self.embedding_loss_accumulator = 0.0
             self.embedding_loss_count = 0
         
-        logger.info(f"precision_ce: {precision_ce} || ce_loss: {ce_loss} || log_var_ce: {log_var_ce}")
-        logger.info(f"precision_embedding: {precision_embedding} || embedding_loss: {embedding_loss} || log_var_embedding: {log_var_embedding}")
         # Even if embedding_loss is zero, include it in total_loss
         total_loss += precision_embedding * embedding_loss + log_var_embedding
 
