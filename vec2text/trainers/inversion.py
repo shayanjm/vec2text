@@ -102,6 +102,17 @@ class InversionTrainer(BaseTrainer):
         # Even if embedding_loss is zero, include it in total_loss
         total_loss += precision_embedding * embedding_loss + log_var_embedding
 
+        # Log the variables to wandb
+        self.log({
+        'ce_loss': ce_loss.detach(),
+        'embedding_loss': embedding_loss.detach(),
+        'log_var_ce': log_var_ce.detach(),
+        'log_var_embedding': log_var_embedding.detach(),
+        'precision_ce': precision_ce.detach(),
+        'precision_embedding': precision_embedding.detach(),
+        'total_loss': total_loss
+        })
+
         return (total_loss, outputs) if return_outputs else total_loss
  
 
