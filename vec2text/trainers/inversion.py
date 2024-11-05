@@ -1,7 +1,7 @@
 import math
 from typing import Dict
 from collections import OrderedDict
-from gradnorm import GradNorm
+from gradnorm_pytorch import GradNormLossWeighter
 
 import torch
 import torch.nn as nn
@@ -27,32 +27,33 @@ class InversionTrainer(BaseTrainer):
         self.embedder = self.model.embedder
 
         # Initialize GradNorm
-        self.gradnorm = GradNorm(num_tasks=2, alpha=0.5) # 2 tasks: ce_loss and embedding_loss
+        self.gradnorm = GradNormLossWeighter(
+            num_losses=2,  # Number of tasks
+            alpha=0.5,     # Hyperparameter for restoring force
+            grad_norm_parameters=self.model.parameters(),  # Shared parameters
+            device=self.args.device  # Ensure GradNorm operates on the correct device
+        )
 
     def compute_loss(self, model, inputs, return_outputs=False):
         # Forward pass
         outputs = model(**inputs)
-        ce_loss = outputs.loss  # Cross-entropy loss computed by the model
+        ce_loss = outputs.loss  # Cross-entropy loss
 
         # Initialize embedding loss to zero
         embedding_loss = torch.tensor(0.0, device=ce_loss.device)
 
-        # Compute embedding loss only at specified intervals
+        # Compute embedding loss at specified intervals
         if (self.state.global_step + 1) % self.embedding_loss_interval == 0:
             logits = outputs.get("logits")
             pred_ids = torch.argmax(logits, dim=-1).detach().cpu()
-
-            # Decode Predicted Tokens to Text
             pred_texts = self.tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
 
-            # Initialize list for embeddings
             embeddings_list = []
             for text in pred_texts:
                 if text in self.embedding_cache:
                     pred_embedding = self.embedding_cache[text].to(ce_loss.device)
                     self.cache_hits += 1
                 else:
-                    # Tokenize and compute embedding
                     pred_inputs = self.embedder_tokenizer(
                         [text],
                         return_tensors='pt',
@@ -69,27 +70,28 @@ class InversionTrainer(BaseTrainer):
                         self.embedding_cache.popitem(last=False)
                 embeddings_list.append(pred_embedding)
 
-            # Stack embeddings and calculate embedding loss
             pred_embeddings = torch.cat(embeddings_list, dim=0)
             target_embeddings = inputs['frozen_embeddings']
             if pred_embeddings.shape != target_embeddings.shape:
                 pred_embeddings = pred_embeddings.view_as(target_embeddings)
             embedding_loss = nn.functional.mse_loss(pred_embeddings, target_embeddings)
 
-        # Use GradNorm to calculate weights for each loss
-        task_losses = [ce_loss, embedding_loss]
-        task_weights = self.gradnorm.get_task_weights(task_losses)
+        # Combine losses
+        losses = [ce_loss, embedding_loss]
 
-        # Compute total loss using GradNorm-adjusted weights
-        total_loss = task_weights[0] * ce_loss + task_weights[1] * embedding_loss
+        # Apply GradNorm
+        self.gradnorm.backward(losses, retain_graph=True)
 
-        # Log metrics to wandb, including GradNorm weights
+        # Compute total loss
+        total_loss = sum(self.gradnorm.loss_weights[i] * losses[i] for i in range(len(losses)))
+
+        # Log metrics
         self.log({
             'ce_loss': ce_loss.detach().item(),
             'embedding_loss': embedding_loss.detach().item(),
             'total_loss': total_loss.detach().item(),
-            'gradnorm_weight_ce': task_weights[0].detach().item(),
-            'gradnorm_weight_embedding': task_weights[1].detach().item(),
+            'gradnorm_weight_ce': self.gradnorm.loss_weights[0].detach().item(),
+            'gradnorm_weight_embedding': self.gradnorm.loss_weights[1].detach().item(),
             'cache_hits': self.cache_hits
         })
 
