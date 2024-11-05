@@ -121,19 +121,6 @@ class InversionModel(transformers.PreTrainedModel):
         self.embeddings_from_layer_n = embeddings_from_layer_n
         self.noise_level = vars(config).get("embedder_gaussian_noise_level")
 
-        # Initialize learnable log variances for each loss
-        self.log_var_ce = nn.Parameter(torch.zeros(()))
-        self.log_var_embedding = nn.Parameter(torch.zeros(()))
-
-        # Ensure these parameters are registered
-        self._register_log_var_parameters()
-
-    def _register_log_var_parameters(self):
-        # This method ensures that the parameters are recognized
-        # by modules like DistributedDataParallel
-        self.register_parameter('log_var_ce', self.log_var_ce)
-        self.register_parameter('log_var_embedding', self.log_var_embedding)
-
     def _freeze_encoder(self):
         freeze_params(self.encoder_decoder.encoder)
 

@@ -10,7 +10,7 @@ import transformers
 from vec2text.trainers.base import BaseTrainer
 
 class InversionTrainer(BaseTrainer):
-    def __init__(self, *args, max_cache_size=10000, embedding_loss_interval=25, **kwargs):
+    def __init__(self, *args, max_cache_size=10000, embedding_loss_interval=1, **kwargs):
         super().__init__(*args, **kwargs)
         # New parameters: maximum cache size and embedding loss interval
         self.max_cache_size = max_cache_size
@@ -27,27 +27,12 @@ class InversionTrainer(BaseTrainer):
         self.embedder = self.model.embedder
 
         # Initialize GradNorm
-        self.gradnorm = GradNorm(num_tasks=2) # 2 tasks: ce_loss and embedding_loss
+        self.gradnorm = GradNorm(num_tasks=2, alpha=0.5) # 2 tasks: ce_loss and embedding_loss
 
     def compute_loss(self, model, inputs, return_outputs=False):
         # Forward pass
         outputs = model(**inputs)
         ce_loss = outputs.loss  # Cross-entropy loss computed by the model
-
-        # Access log_var_ce and log_var_embedding
-        if isinstance(model, torch.nn.DataParallel) or isinstance(model, torch.nn.parallel.DistributedDataParallel):
-            log_var_ce = model.module.log_var_ce
-            log_var_embedding = model.module.log_var_embedding
-        else:
-            log_var_ce = model.log_var_ce
-            log_var_embedding = model.log_var_embedding
-
-        # Compute precisions
-        precision_ce = torch.exp(-log_var_ce)
-        precision_embedding = torch.exp(-log_var_embedding)
-
-        # Compute total loss with cross-entropy loss components
-        total_loss = precision_ce * ce_loss + log_var_ce
 
         # Initialize embedding loss to zero
         embedding_loss = torch.tensor(0.0, device=ce_loss.device)
@@ -64,9 +49,8 @@ class InversionTrainer(BaseTrainer):
             embeddings_list = []
             for text in pred_texts:
                 if text in self.embedding_cache:
-                    # Retrieve from cache and move to device
                     pred_embedding = self.embedding_cache[text].to(ce_loss.device)
-                    self.cache_hits += 1  # Increment cache hit counter
+                    self.cache_hits += 1
                 else:
                     # Tokenize and compute embedding
                     pred_inputs = self.embedder_tokenizer(
@@ -80,44 +64,33 @@ class InversionTrainer(BaseTrainer):
                         input_ids=pred_inputs['input_ids'],
                         attention_mask=pred_inputs['attention_mask'],
                     )
-                    # Store in cache and enforce max cache size
                     self.embedding_cache[text] = pred_embedding.detach().cpu()
                     if len(self.embedding_cache) > self.max_cache_size:
                         self.embedding_cache.popitem(last=False)
                 embeddings_list.append(pred_embedding)
 
-            # Stack embeddings
+            # Stack embeddings and calculate embedding loss
             pred_embeddings = torch.cat(embeddings_list, dim=0)
-
-            # Get Target Embeddings
             target_embeddings = inputs['frozen_embeddings']
             if pred_embeddings.shape != target_embeddings.shape:
                 pred_embeddings = pred_embeddings.view_as(target_embeddings)
-
-            # Compute Embedding Distance (e.g., Mean Squared Error)
             embedding_loss = nn.functional.mse_loss(pred_embeddings, target_embeddings)
-            self.embedding_loss_accumulator = 0.0
-            self.embedding_loss_count = 0
 
-        # Integrate GradNorm to adjust task-specific weights
-        # Assuming tasks=[ce_loss, embedding_loss]
-        task_losses = torch.stack([ce_loss, embedding_loss])
-        adjusted_task_losses = self.gradnorm(task_losses)
+        # Use GradNorm to calculate weights for each loss
+        task_losses = [ce_loss, embedding_loss]
+        task_weights = self.gradnorm.get_task_weights(task_losses)
 
-        # Recalculate total loss using adjusted task losses
-        total_loss = precision_ce * adjusted_task_losses[0] + log_var_ce + \
-                     precision_embedding * adjusted_task_losses[1] + log_var_embedding
+        # Compute total loss using GradNorm-adjusted weights
+        total_loss = task_weights[0] * ce_loss + task_weights[1] * embedding_loss
 
-        # Log metrics to wandb
+        # Log metrics to wandb, including GradNorm weights
         self.log({
             'ce_loss': ce_loss.detach().item(),
             'embedding_loss': embedding_loss.detach().item(),
-            'log_var_ce': log_var_ce.detach().item(),
-            'log_var_embedding': log_var_embedding.detach().item(),
-            'precision_ce': precision_ce.detach().item(),
-            'precision_embedding': precision_embedding.detach().item(),
             'total_loss': total_loss.detach().item(),
-            'cache_hits': self.cache_hits  # Log cache hits
+            'gradnorm_weight_ce': task_weights[0].detach().item(),
+            'gradnorm_weight_embedding': task_weights[1].detach().item(),
+            'cache_hits': self.cache_hits
         })
 
         return (total_loss, outputs) if return_outputs else total_loss
