@@ -31,7 +31,6 @@ class InversionTrainer(BaseTrainer):
             num_losses=2,  # Number of tasks
             restoring_force_alpha=0.5,     # Hyperparameter for restoring force
             grad_norm_parameters=None,  # Shared parameters
-            device=self.args.device  # Ensure GradNorm operates on the correct device
         )
 
     def compute_loss(self, model, inputs, return_outputs=False):
