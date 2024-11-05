@@ -1,6 +1,7 @@
 import math
 from typing import Dict
 from collections import OrderedDict
+from gradnorm import GradNorm
 
 import torch
 import torch.nn as nn
@@ -18,11 +19,15 @@ class InversionTrainer(BaseTrainer):
         self.embedding_loss_count = 0  # Track number of accumulated steps
         # Initialize cache using OrderedDict for LRU functionality
         self.embedding_cache = OrderedDict()
+        self.cache_hits = 0
         # Existing initializations
         self.tokenizer = self.model.tokenizer
         self.embedder_tokenizer = self.model.embedder_tokenizer
         self.call_embedding_model = self.model.call_embedding_model
         self.embedder = self.model.embedder
+
+        # Initialize GradNorm
+        self.gradnorm = GradNorm(num_tasks=2) # 2 tasks: ce_loss and embedding_loss
 
     def compute_loss(self, model, inputs, return_outputs=False):
         # Forward pass
@@ -49,9 +54,8 @@ class InversionTrainer(BaseTrainer):
 
         # Compute embedding loss only at specified intervals
         if (self.state.global_step + 1) % self.embedding_loss_interval == 0:
-            logits = outputs.get("logits")  # Shape: (batch_size, sequence_length, vocab_size)
-            pred_ids = torch.argmax(logits, dim=-1)
-            pred_ids = pred_ids.detach().cpu()
+            logits = outputs.get("logits")
+            pred_ids = torch.argmax(logits, dim=-1).detach().cpu()
 
             # Decode Predicted Tokens to Text
             pred_texts = self.tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
@@ -62,6 +66,7 @@ class InversionTrainer(BaseTrainer):
                 if text in self.embedding_cache:
                     # Retrieve from cache and move to device
                     pred_embedding = self.embedding_cache[text].to(ce_loss.device)
+                    self.cache_hits += 1  # Increment cache hit counter
                 else:
                     # Tokenize and compute embedding
                     pred_inputs = self.embedder_tokenizer(
@@ -78,7 +83,6 @@ class InversionTrainer(BaseTrainer):
                     # Store in cache and enforce max cache size
                     self.embedding_cache[text] = pred_embedding.detach().cpu()
                     if len(self.embedding_cache) > self.max_cache_size:
-                        # Remove oldest item
                         self.embedding_cache.popitem(last=False)
                 embeddings_list.append(pred_embedding)
 
@@ -87,30 +91,33 @@ class InversionTrainer(BaseTrainer):
 
             # Get Target Embeddings
             target_embeddings = inputs['frozen_embeddings']
-
-            # Ensure the shapes match
             if pred_embeddings.shape != target_embeddings.shape:
-                # Adjust shapes if necessary
                 pred_embeddings = pred_embeddings.view_as(target_embeddings)
 
             # Compute Embedding Distance (e.g., Mean Squared Error)
             embedding_loss = nn.functional.mse_loss(pred_embeddings, target_embeddings)
-            # Reset the accumulator and count
             self.embedding_loss_accumulator = 0.0
             self.embedding_loss_count = 0
-        
-        # Even if embedding_loss is zero, include it in total_loss
-        total_loss += precision_embedding * embedding_loss + log_var_embedding
 
-        # Log the variables to wandb
+        # Integrate GradNorm to adjust task-specific weights
+        # Assuming tasks=[ce_loss, embedding_loss]
+        task_losses = torch.stack([ce_loss, embedding_loss])
+        adjusted_task_losses = self.gradnorm(task_losses)
+
+        # Recalculate total loss using adjusted task losses
+        total_loss = precision_ce * adjusted_task_losses[0] + log_var_ce + \
+                     precision_embedding * adjusted_task_losses[1] + log_var_embedding
+
+        # Log metrics to wandb
         self.log({
-        'ce_loss': ce_loss.detach(),
-        'embedding_loss': embedding_loss.detach(),
-        'log_var_ce': log_var_ce.detach(),
-        'log_var_embedding': log_var_embedding.detach(),
-        'precision_ce': precision_ce.detach(),
-        'precision_embedding': precision_embedding.detach(),
-        'total_loss': total_loss
+            'ce_loss': ce_loss.detach().item(),
+            'embedding_loss': embedding_loss.detach().item(),
+            'log_var_ce': log_var_ce.detach().item(),
+            'log_var_embedding': log_var_embedding.detach().item(),
+            'precision_ce': precision_ce.detach().item(),
+            'precision_embedding': precision_embedding.detach().item(),
+            'total_loss': total_loss.detach().item(),
+            'cache_hits': self.cache_hits  # Log cache hits
         })
 
         return (total_loss, outputs) if return_outputs else total_loss
