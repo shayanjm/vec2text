@@ -29,7 +29,7 @@ class InversionTrainer(BaseTrainer):
         # Initialize GradNorm
         self.gradnorm = GradNormLossWeighter(
             num_losses=2,  # Number of tasks
-            alpha=0.5,     # Hyperparameter for restoring force
+            restoring_force_alpha=0.5,     # Hyperparameter for restoring force
             grad_norm_parameters=None,  # Shared parameters
             device=self.args.device  # Ensure GradNorm operates on the correct device
         )
