@@ -38,6 +38,9 @@ class InversionTrainer(BaseTrainer):
         outputs = model(**inputs)
         ce_loss = outputs.loss  # Cross-entropy loss
 
+        # Pull last layer's activations
+        activations = outputs.hidden_states[-1]  # Replace with the appropriate activation layer
+
         # Initialize embedding loss to zero
         embedding_loss = torch.tensor(0.0, device=ce_loss.device)
 
@@ -78,8 +81,8 @@ class InversionTrainer(BaseTrainer):
         # Combine losses
         losses = [ce_loss, embedding_loss]
 
-        # Apply GradNorm
-        self.gradnorm.backward(losses, retain_graph=True)
+        # Apply GradNorm, passing activations
+        self.gradnorm.backward(losses, activations=activations, retain_graph=True)
 
         # Compute total loss
         total_loss = sum(self.gradnorm.loss_weights[i] * losses[i] for i in range(len(losses)))
