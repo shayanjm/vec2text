@@ -82,7 +82,7 @@ class InversionTrainer(BaseTrainer):
         losses = [ce_loss, embedding_loss]
 
         # Apply GradNorm, passing activations
-        self.gradnorm.backward(losses, activations=activations, retain_graph=True)
+        self.gradnorm.backward(losses, activations=activations, allow_unused=True, retain_graph=True)
 
         # Compute total loss
         total_loss = sum(self.gradnorm.loss_weights[i] * losses[i] for i in range(len(losses)))
