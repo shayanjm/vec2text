@@ -39,7 +39,7 @@ class InversionTrainer(BaseTrainer):
         ce_loss = outputs.loss  # Cross-entropy loss
 
         # Pull last layer's activations
-        activations = outputs.hidden_states[-1]  # Replace with the appropriate activation layer
+        activations = outputs.last_hidden_state
 
         # Initialize embedding loss to zero
         embedding_loss = torch.tensor(0.0, device=ce_loss.device)
