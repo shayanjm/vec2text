@@ -19,6 +19,9 @@ class InversionTrainer(BaseTrainer):
         self.embedding_loss_interval = embedding_loss_interval
         self.embedding_loss_accumulator = 0.0  # Initialize embedding loss accumulator
         self.embedding_loss_count = 0  # Track number of accumulated steps
+        self.ce_running_mean = 1.0  # Initialize running mean for ce_loss
+        self.embedding_running_mean = 1.0  # Initialize running mean for embedding_loss
+        self.alpha = 0.01  # Smoothing factor for EWMA
         # Initialize cache using OrderedDict for LRU functionality
         self.embedding_cache = OrderedDict()
         self.cache_hits = 0
@@ -67,31 +70,30 @@ class InversionTrainer(BaseTrainer):
             target_embeddings = inputs["frozen_embeddings"]
             if pred_embeddings.shape != target_embeddings.shape:
                 pred_embeddings = pred_embeddings.view_as(target_embeddings)
-            embedding_loss = nn.functional.mse_loss(pred_embeddings, target_embeddings)
+            embedding_loss = nn.functional.mse_loss(pred_embeddings, target_embeddings, )
 
-        # Normalize losses
-        ce_loss_mean = ce_loss.detach().mean()  # Batch mean for normalization
-        embedding_loss_mean = (
-            embedding_loss.detach().mean() if embedding_loss.requires_grad else 1.0
-        )
+        # Update running means
+        self.ce_running_mean = self.alpha * ce_loss.item() + (1 - self.alpha) * self.ce_running_mean
+        self.embedding_running_mean = self.alpha * embedding_loss.item() + (1 - self.alpha) * self.embedding_running_mean
 
-        normalized_ce_loss = ce_loss / ce_loss_mean
-        normalized_embedding_loss = embedding_loss / embedding_loss_mean
+        # Normalize losses using running means
+        normalized_ce_loss = ce_loss / self.ce_running_mean
+        normalized_embedding_loss = embedding_loss / self.embedding_running_mean
 
         # Combine normalized losses
         total_loss = normalized_ce_loss + normalized_embedding_loss
 
         # Log metrics
-        self.log(
-            {
-                "ce_loss": ce_loss.detach().item(),
-                "embedding_loss": embedding_loss.detach().item(),
-                "normalized_ce_loss": normalized_ce_loss.detach().item(),
-                "normalized_embedding_loss": normalized_embedding_loss.detach().item(),
-                "total_loss": total_loss.detach().item(),
-                "cache_hits": self.cache_hits,
-            }
-        )
+        self.log({
+            'ce_loss': ce_loss.detach().item(),
+            'embedding_loss': embedding_loss.detach().item(),
+            'ce_running_mean': self.ce_running_mean,
+            'embedding_running_mean': self.embedding_running_mean,
+            'normalized_ce_loss': normalized_ce_loss.detach().item(),
+            'normalized_embedding_loss': normalized_embedding_loss.detach().item(),
+            'total_loss': total_loss.detach().item(),
+            'cache_hits': self.cache_hits
+        })
 
         return (total_loss, outputs) if return_outputs else total_loss
 
