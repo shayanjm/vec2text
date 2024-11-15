@@ -1,7 +1,6 @@
 import math
 from typing import Dict
 from collections import OrderedDict
-from gradnorm_pytorch import GradNormLossWeighter
 
 import torch
 import torch.nn as nn
@@ -38,10 +37,6 @@ class InversionTrainer(BaseTrainer):
         outputs = model(**inputs)
         ce_loss = outputs.loss  # Cross-entropy loss
 
-        # Pull last layer's activations
-        activations = outputs.encoder_last_hidden_state
-
-        # Initialize embedding loss to zero
         embedding_loss = torch.tensor(0.0, device=ce_loss.device)
 
         # Compute embedding loss at specified intervals
@@ -50,7 +45,7 @@ class InversionTrainer(BaseTrainer):
             pred_ids = torch.argmax(logits, dim=-1).detach().cpu()
             pred_texts = self.tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
 
-            embeddings_list = []
+            pred_embeddings = []
             for text in pred_texts:
                 if text in self.embedding_cache:
                     pred_embedding = self.embedding_cache[text].to(ce_loss.device)
@@ -70,30 +65,32 @@ class InversionTrainer(BaseTrainer):
                     self.embedding_cache[text] = pred_embedding.detach().cpu()
                     if len(self.embedding_cache) > self.max_cache_size:
                         self.embedding_cache.popitem(last=False)
-                embeddings_list.append(pred_embedding)
+                pred_embeddings.append(pred_embedding)
 
-            pred_embeddings = torch.cat(embeddings_list, dim=0)
+            pred_embeddings = torch.stack(pred_embeddings)
             target_embeddings = inputs['frozen_embeddings']
             if pred_embeddings.shape != target_embeddings.shape:
                 pred_embeddings = pred_embeddings.view_as(target_embeddings)
             embedding_loss = nn.functional.mse_loss(pred_embeddings, target_embeddings)
 
-        # Combine losses
-        losses = [ce_loss, embedding_loss]
+        # Normalize losses
+        ce_loss_mean = ce_loss.detach().mean()  # Batch mean for normalization
+        embedding_loss_mean = embedding_loss.detach().mean() if embedding_loss.requires_grad else 1.0
 
-        # Apply GradNorm, passing activations
-        self.gradnorm.backward(losses, activations=activations, allow_unused=True, retain_graph=True)
+        normalized_ce_loss = ce_loss / ce_loss_mean
+        normalized_embedding_loss = embedding_loss / embedding_loss_mean
 
-        # Compute total loss
-        total_loss = sum(self.gradnorm.loss_weights[i] * losses[i] for i in range(len(losses)))
+        # Combine normalized losses
+        total_loss = normalized_ce_loss + normalized_embedding_loss
 
+        # Log metrics
         # Log metrics
         self.log({
             'ce_loss': ce_loss.detach().item(),
             'embedding_loss': embedding_loss.detach().item(),
+            'normalized_ce_loss': normalized_ce_loss.detach().item(),
+            'normalized_embedding_loss': normalized_embedding_loss.detach().item(),
             'total_loss': total_loss.detach().item(),
-            'gradnorm_weight_ce': self.gradnorm.loss_weights[0].detach().item(),
-            'gradnorm_weight_embedding': self.gradnorm.loss_weights[1].detach().item(),
             'cache_hits': self.cache_hits
         })
 
