@@ -8,8 +8,11 @@ import transformers
 
 from vec2text.trainers.base import BaseTrainer
 
+
 class InversionTrainer(BaseTrainer):
-    def __init__(self, *args, max_cache_size=10000, embedding_loss_interval=1, **kwargs):
+    def __init__(
+        self, *args, max_cache_size=10000, embedding_loss_interval=1, **kwargs
+    ):
         super().__init__(*args, **kwargs)
         # New parameters: maximum cache size and embedding loss interval
         self.max_cache_size = max_cache_size
@@ -46,14 +49,14 @@ class InversionTrainer(BaseTrainer):
                 else:
                     pred_inputs = self.embedder_tokenizer(
                         [text],
-                        return_tensors='pt',
+                        return_tensors="pt",
                         padding=True,
                         truncation=True,
                         max_length=self.embedder_tokenizer.model_max_length,
                     ).to(ce_loss.device)
                     pred_embedding = self.call_embedding_model(
-                        input_ids=pred_inputs['input_ids'],
-                        attention_mask=pred_inputs['attention_mask'],
+                        input_ids=pred_inputs["input_ids"],
+                        attention_mask=pred_inputs["attention_mask"],
                     )
                     self.embedding_cache[text] = pred_embedding.detach().cpu()
                     if len(self.embedding_cache) > self.max_cache_size:
@@ -61,14 +64,16 @@ class InversionTrainer(BaseTrainer):
                 pred_embeddings.append(pred_embedding)
 
             pred_embeddings = torch.stack(pred_embeddings)
-            target_embeddings = inputs['frozen_embeddings']
+            target_embeddings = inputs["frozen_embeddings"]
             if pred_embeddings.shape != target_embeddings.shape:
                 pred_embeddings = pred_embeddings.view_as(target_embeddings)
             embedding_loss = nn.functional.mse_loss(pred_embeddings, target_embeddings)
 
         # Normalize losses
         ce_loss_mean = ce_loss.detach().mean()  # Batch mean for normalization
-        embedding_loss_mean = embedding_loss.detach().mean() if embedding_loss.requires_grad else 1.0
+        embedding_loss_mean = (
+            embedding_loss.detach().mean() if embedding_loss.requires_grad else 1.0
+        )
 
         normalized_ce_loss = ce_loss / ce_loss_mean
         normalized_embedding_loss = embedding_loss / embedding_loss_mean
@@ -77,23 +82,24 @@ class InversionTrainer(BaseTrainer):
         total_loss = normalized_ce_loss + normalized_embedding_loss
 
         # Log metrics
-        self.log({
-            'ce_loss': ce_loss.detach().item(),
-            'embedding_loss': embedding_loss.detach().item(),
-            'normalized_ce_loss': normalized_ce_loss.detach().item(),
-            'normalized_embedding_loss': normalized_embedding_loss.detach().item(),
-            'total_loss': total_loss.detach().item(),
-            'cache_hits': self.cache_hits
-        })
+        self.log(
+            {
+                "ce_loss": ce_loss.detach().item(),
+                "embedding_loss": embedding_loss.detach().item(),
+                "normalized_ce_loss": normalized_ce_loss.detach().item(),
+                "normalized_embedding_loss": normalized_embedding_loss.detach().item(),
+                "total_loss": total_loss.detach().item(),
+                "cache_hits": self.cache_hits,
+            }
+        )
 
         return (total_loss, outputs) if return_outputs else total_loss
- 
 
     def generate(self, inputs: Dict, generation_kwargs: Dict) -> torch.Tensor:
         return self.model.generate(inputs=inputs, generation_kwargs=generation_kwargs)
 
     def training_step(
-        self, model: nn.Module, inputs: Dict[str, torch.Tensor]
+        self, model: nn.Module, inputs: Dict[str, torch.Tensor], num_items_in_batch: int
     ) -> torch.Tensor:
         """
         Performs a training step. we override to compute data-specific metrics.
