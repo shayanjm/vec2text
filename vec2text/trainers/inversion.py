@@ -20,8 +20,9 @@ class InversionTrainer(BaseTrainer):
         self.embedding_loss_accumulator = 0.0  # Initialize embedding loss accumulator
         self.embedding_loss_count = 0  # Track number of accumulated steps
         self.ce_running_mean = 1.0  # Initialize running mean for ce_loss
+        self.ce_batch_count = 0  # Track number of batches for ce_loss
         self.embedding_running_mean = 1.0  # Initialize running mean for embedding_loss
-        self.alpha = 0.01  # Smoothing factor for EWMA
+        self.embedding_batch_count = 0  # Track number of batches for embedding_loss
         # Initialize cache using OrderedDict for LRU functionality
         self.embedding_cache = OrderedDict()
         self.cache_hits = 0
@@ -72,9 +73,12 @@ class InversionTrainer(BaseTrainer):
                 pred_embeddings = pred_embeddings.view_as(target_embeddings)
             embedding_loss = nn.functional.mse_loss(pred_embeddings, target_embeddings, )
 
-        # Update running means
-        self.ce_running_mean = self.alpha * ce_loss.item() + (1 - self.alpha) * self.ce_running_mean
-        self.embedding_running_mean = self.alpha * embedding_loss.item() + (1 - self.alpha) * self.embedding_running_mean
+        # Update decaying window means
+        self.ce_batch_count += 1
+        self.ce_running_mean = (self.ce_running_mean * (self.ce_batch_count - 1) + ce_loss.item()) / self.ce_batch_count
+
+        self.embedding_batch_count += 1
+        self.embedding_running_mean = (self.embedding_running_mean * (self.embedding_batch_count - 1) + embedding_loss.item()) / self.embedding_batch_count
 
         # Normalize losses using running means
         normalized_ce_loss = ce_loss / self.ce_running_mean
