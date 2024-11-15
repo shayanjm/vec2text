@@ -25,13 +25,6 @@ class InversionTrainer(BaseTrainer):
         self.call_embedding_model = self.model.call_embedding_model
         self.embedder = self.model.embedder
 
-        # Initialize GradNorm
-        self.gradnorm = GradNormLossWeighter(
-            num_losses=2,  # Number of tasks
-            restoring_force_alpha=0.5,     # Hyperparameter for restoring force
-            grad_norm_parameters=None,  # Shared parameters
-        )
-
     def compute_loss(self, model, inputs, return_outputs=False):
         # Forward pass
         outputs = model(**inputs)
@@ -83,7 +76,6 @@ class InversionTrainer(BaseTrainer):
         # Combine normalized losses
         total_loss = normalized_ce_loss + normalized_embedding_loss
 
-        # Log metrics
         # Log metrics
         self.log({
             'ce_loss': ce_loss.detach().item(),
