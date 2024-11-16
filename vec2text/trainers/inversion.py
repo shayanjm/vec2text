@@ -11,12 +11,11 @@ from vec2text.trainers.base import BaseTrainer
 
 class InversionTrainer(BaseTrainer):
     def __init__(
-        self, *args, max_cache_size=10000, embedding_loss_interval=1, **kwargs
+        self, *args, max_cache_size=10000, **kwargs
     ):
         super().__init__(*args, **kwargs)
         # New parameters: maximum cache size and embedding loss interval
         self.max_cache_size = max_cache_size
-        self.embedding_loss_interval = embedding_loss_interval
         self.embedding_loss_accumulator = 0.0  # Initialize embedding loss accumulator
         self.embedding_loss_count = 0  # Track number of accumulated steps
         self.ce_running_mean = 1.0  # Initialize running mean for ce_loss
@@ -40,38 +39,37 @@ class InversionTrainer(BaseTrainer):
         embedding_loss = torch.tensor(0.0, device=ce_loss.device)
 
         # Compute embedding loss at specified intervals
-        if (self.state.global_step + 1) % self.embedding_loss_interval == 0:
-            logits = outputs.get("logits")
-            pred_ids = torch.argmax(logits, dim=-1).detach().cpu()
-            pred_texts = self.tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
+        logits = outputs.get("logits")
+        pred_ids = torch.argmax(logits, dim=-1).detach().cpu()
+        pred_texts = self.tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
 
-            pred_embeddings = []
-            for text in pred_texts:
-                if text in self.embedding_cache:
-                    pred_embedding = self.embedding_cache[text].to(ce_loss.device)
-                    self.cache_hits += 1
-                else:
-                    pred_inputs = self.embedder_tokenizer(
-                        [text],
-                        return_tensors="pt",
-                        padding=True,
-                        truncation=True,
-                        max_length=self.embedder_tokenizer.model_max_length,
-                    ).to(ce_loss.device)
-                    pred_embedding = self.call_embedding_model(
-                        input_ids=pred_inputs["input_ids"],
-                        attention_mask=pred_inputs["attention_mask"],
-                    )
-                    self.embedding_cache[text] = pred_embedding.detach().cpu()
-                    if len(self.embedding_cache) > self.max_cache_size:
-                        self.embedding_cache.popitem(last=False)
-                pred_embeddings.append(pred_embedding)
+        pred_embeddings = []
+        for text in pred_texts:
+            if text in self.embedding_cache:
+                pred_embedding = self.embedding_cache[text].to(ce_loss.device)
+                self.cache_hits += 1
+            else:
+                pred_inputs = self.embedder_tokenizer(
+                    [text],
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=self.embedder_tokenizer.model_max_length,
+                ).to(ce_loss.device)
+                pred_embedding = self.call_embedding_model(
+                    input_ids=pred_inputs["input_ids"],
+                    attention_mask=pred_inputs["attention_mask"],
+                )
+                self.embedding_cache[text] = pred_embedding.detach().cpu()
+                if len(self.embedding_cache) > self.max_cache_size:
+                    self.embedding_cache.popitem(last=False)
+            pred_embeddings.append(pred_embedding)
 
-            pred_embeddings = torch.stack(pred_embeddings)
-            target_embeddings = inputs["frozen_embeddings"]
-            if pred_embeddings.shape != target_embeddings.shape:
-                pred_embeddings = pred_embeddings.view_as(target_embeddings)
-            embedding_loss = nn.functional.mse_loss(pred_embeddings, target_embeddings, )
+        pred_embeddings = torch.stack(pred_embeddings)
+        target_embeddings = inputs["frozen_embeddings"]
+        if pred_embeddings.shape != target_embeddings.shape:
+            pred_embeddings = pred_embeddings.view_as(target_embeddings)
+        embedding_loss = nn.functional.mse_loss(pred_embeddings, target_embeddings)
 
         # Update decaying window means
         self.ce_batch_count += 1
