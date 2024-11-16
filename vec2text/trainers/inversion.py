@@ -16,7 +16,6 @@ class InversionTrainer(BaseTrainer):
         super().__init__(*args, **kwargs)
         # New parameters: maximum cache size and embedding loss interval
         self.max_cache_size = max_cache_size
-        self.embedding_loss_accumulator = 0.0  # Initialize embedding loss accumulator
         self.embedding_loss_count = 0  # Track number of accumulated steps
         self.ce_running_mean = 1.0  # Initialize running mean for ce_loss
         self.ce_batch_count = 0  # Track number of batches for ce_loss
