@@ -68,7 +68,7 @@ class InversionTrainer(BaseTrainer):
         target_embeddings = inputs["frozen_embeddings"]
         if pred_embeddings.shape != target_embeddings.shape:
             pred_embeddings = pred_embeddings.view_as(target_embeddings)
-        embedding_loss = nn.functional.mse_loss(pred_embeddings, target_embeddings)
+        embedding_loss = nn.functional.mse_loss(pred_embeddings, target_embeddings, reduction='sum') # Try summing for a bigger number
 
         # Update decaying window means
         self.ce_batch_count += 1
