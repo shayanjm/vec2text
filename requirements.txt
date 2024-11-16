@@ -3,14 +3,13 @@ bert_score
 datasets
 einops
 evaluate
-gradnorm-pytorch
 openai
 optimum
 pre-commit
 rouge_score
 sacrebleu
-sentence_transformers
+sentence_transformers==3.2.1
 tenacity
 tokenizers
 tqdm
-transformers
+transformers==4.45.2

@@ -32,7 +32,7 @@ class InversionTrainer(BaseTrainer):
         self.call_embedding_model = self.model.call_embedding_model
         self.embedder = self.model.embedder
 
-    def compute_loss(self, model, inputs, num_items_in_batch, return_outputs=False):
+    def compute_loss(self, model, inputs, return_outputs=False):
         # Forward pass
         outputs = model(**inputs)
         ce_loss = outputs.loss  # Cross-entropy loss
@@ -105,7 +105,7 @@ class InversionTrainer(BaseTrainer):
         return self.model.generate(inputs=inputs, generation_kwargs=generation_kwargs)
 
     def training_step(
-        self, model: nn.Module, inputs: Dict[str, torch.Tensor], num_items_in_batch: int
+        self, model: nn.Module, inputs: Dict[str, torch.Tensor]
     ) -> torch.Tensor:
         """
         Performs a training step. we override to compute data-specific metrics.
