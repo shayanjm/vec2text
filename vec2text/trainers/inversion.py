@@ -40,6 +40,7 @@ class InversionTrainer(BaseTrainer):
     ):
         super().__init__(*args, **kwargs)
         self.uncertainty_loss = UncertaintyLoss()
+
         # New parameters: maximum cache size and embedding loss interval
         self.max_cache_size = max_cache_size
         self.embedding_loss_count = 0  # Track number of accumulated steps
@@ -62,6 +63,10 @@ class InversionTrainer(BaseTrainer):
         ce_loss = outputs.loss  # Cross-entropy loss
 
         embedding_loss = torch.tensor(0.0, device=ce_loss.device)
+        
+        params = list(self.model.parameters()) + list(self.uncertainty_loss.parameters())
+        self.optimizer = torch.optim.AdamW(params, lr=1e-3)
+
 
         # Compute embedding loss at specified intervals
         logits = outputs.get("logits")
