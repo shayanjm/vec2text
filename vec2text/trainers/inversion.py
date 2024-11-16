@@ -8,12 +8,38 @@ import transformers
 
 from vec2text.trainers.base import BaseTrainer
 
+class UncertaintyLoss(nn.Module):
+    def __init__(self):
+        super(UncertaintyLoss, self).__init__()
+        # Learnable log-variance parameters for uncertainty weighting
+        self.log_sigma_ce = nn.Parameter(torch.tensor(0.0))  # For cross-entropy loss
+        self.log_sigma_embedding = nn.Parameter(torch.tensor(0.0))  # For embedding loss
+
+    def forward(self, ce_loss, embedding_loss):
+        # Compute uncertainties
+        sigma_ce = torch.exp(self.log_sigma_ce)
+        sigma_embedding = torch.exp(self.log_sigma_embedding)
+
+        # Weighted total loss
+        weighted_ce_loss = ce_loss / (2 * sigma_ce**2) + self.log_sigma_ce
+        weighted_embedding_loss = embedding_loss / (2 * sigma_embedding**2) + self.log_sigma_embedding
+
+        # Combine losses
+        total_loss = weighted_ce_loss + weighted_embedding_loss
+
+        return total_loss, {
+            'weighted_ce_loss': weighted_ce_loss.detach().item(),
+            'weighted_embedding_loss': weighted_embedding_loss.detach().item(),
+            'log_sigma_ce': self.log_sigma_ce.detach().item(),
+            'log_sigma_embedding': self.log_sigma_embedding.detach().item(),
+        }
 
 class InversionTrainer(BaseTrainer):
     def __init__(
         self, *args, max_cache_size=10000, **kwargs
     ):
         super().__init__(*args, **kwargs)
+        self.uncertainty_loss = UncertaintyLoss()
         # New parameters: maximum cache size and embedding loss interval
         self.max_cache_size = max_cache_size
         self.embedding_loss_count = 0  # Track number of accumulated steps
@@ -81,8 +107,8 @@ class InversionTrainer(BaseTrainer):
         normalized_ce_loss = ce_loss / self.ce_running_mean
         normalized_embedding_loss = embedding_loss / self.embedding_running_mean
 
-        # Combine normalized losses
-        total_loss = normalized_ce_loss + normalized_embedding_loss
+        # Use the uncertainty loss function to compute the total loss
+        total_loss, loss_info = self.uncertainty_loss(normalized_ce_loss, normalized_embedding_loss)
 
         # Log metrics
         self.log({
@@ -93,6 +119,7 @@ class InversionTrainer(BaseTrainer):
             'normalized_ce_loss': normalized_ce_loss.detach().item(),
             'normalized_embedding_loss': normalized_embedding_loss.detach().item(),
             'total_loss': total_loss.detach().item(),
+            **loss_info,
             'cache_hits': self.cache_hits
         })
 
