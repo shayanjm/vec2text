@@ -70,7 +70,6 @@ class InversionModel(transformers.PreTrainedModel):
         num_repeat_tokens = config.num_repeat_tokens
         embedder_no_grad = config.embedder_no_grad
 
-        self.max_seq_length = config.max_seq_length
         self.encoder_decoder = encoder_decoder  # .to_bettertransformer()
         ######################################################
         self.num_repeat_tokens = num_repeat_tokens
@@ -263,79 +262,35 @@ class InversionModel(transformers.PreTrainedModel):
         inputs: Dict[str, torch.Tensor],
         generation_kwargs: Dict[str, torch.Tensor],
     ) -> torch.Tensor:
-        """
-        Override generate to use the uncertainty-weighted decoding strategy as the default.
-        """
-        generation_kwargs = copy.copy(generation_kwargs)  # Make a copy to edit
-        beam_width = generation_kwargs.pop("beam_width", 10)
-        max_length = self.max_seq_length
-        embedding_check_interval = generation_kwargs.pop("embedding_check_interval", 5)
+        generation_kwargs = copy.copy(generation_kwargs)  # make a copy so we can edit
+        inputs_embeds, attention_mask = self.embed_and_project(
+            embedder_input_ids=inputs.get("embedder_input_ids"),
+            embedder_attention_mask=inputs.get("embedder_attention_mask"),
+            frozen_embeddings=inputs.get("frozen_embeddings"),
+        )
 
-        # Extract learned uncertainty parameters
-        sigma_cos2 = torch.exp(self.log_sigma_cos)
-        sigma_mse2 = torch.exp(self.log_sigma_mse)
-
-        # Fetch embeddings
-        target_embedding = inputs["frozen_embeddings"]
-
-        # Initialize beams
-        beams = [{"tokens": [self.tokenizer.bos_token_id], "score": 0.0}]
-        completed_beams = []
-
-        for step in range(max_length):
-            new_beams = []
-            for beam in beams:
-                tokens = beam["tokens"]
-                score = beam["score"]
-
-                # Expand current beam
-                input_ids = torch.tensor([tokens], device=self.device)
-                outputs = self.encoder_decoder(input_ids=input_ids)
-                logits = outputs.logits[:, -1, :]
-                next_token_probs = torch.nn.functional.log_softmax(logits, dim=-1)
-
-                top_k_probs, top_k_tokens = torch.topk(next_token_probs, beam_width, dim=-1)
-
-                for prob, token in zip(top_k_probs.squeeze(), top_k_tokens.squeeze()):
-                    new_tokens = tokens + [token.item()]
-                    new_score = score + prob.item()
-
-                    # Periodically compute embedding metrics
-                    if step % embedding_check_interval == 0 or step == max_length - 1:
-                        partial_sequence = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
-                        pred_embedding = self.call_embedding_model(
-                            input_ids=torch.tensor([self.tokenizer.encode(partial_sequence)], device=self.device),
-                            attention_mask=torch.ones(len(new_tokens), device=self.device),
-                        )
-
-                        # Compute Cosine Similarity
-                        cosine_sim = torch.nn.functional.cosine_similarity(
-                            pred_embedding, target_embedding, dim=-1
-                        ).item()
-
-                        # Compute MSE
-                        mse = torch.nn.functional.mse_loss(pred_embedding, target_embedding).item()
-
-                        # Combine metrics using uncertainty weights
-                        metric_score = (1 / sigma_cos2) * cosine_sim - (1 / sigma_mse2) * mse
-                        new_score += metric_score
-
-                    new_beams.append({"tokens": new_tokens, "score": new_score})
-
-            # Prune to top-k beams
-            beams = sorted(new_beams, key=lambda x: x["score"], reverse=True)[:beam_width]
-
-            # Check for completed sequences
-            for beam in beams:
-                if beam["tokens"][-1] == self.tokenizer.eos_token_id:
-                    completed_beams.append(beam)
-
-            if len(completed_beams) >= beam_width:
-                break
-
-        # Return the best sequence
-        best_sequence = sorted(completed_beams, key=lambda x: x["score"], reverse=True)[0]["tokens"]
-        return torch.tensor(best_sequence, device=self.device)
+        if "decoder_input_ids" in inputs:
+            return self.encoder_decoder.generate(
+                # required: input embeddings
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                # optional: input IDs (for starting generation).
+                # typically not set unless generating prefixes for
+                # reranking.
+                decoder_input_ids=inputs["decoder_input_ids"],
+                # decoder_attention_mask=inputs["decoder_attention_mask"],
+                **generation_kwargs,
+            )
+        else:
+            return self.encoder_decoder.generate(
+                # required: input embeddings
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                # optional: input IDs (for starting generation).
+                # typically not set unless generating prefixes for
+                # reranking.
+                **generation_kwargs,
+            )
 
     def forward(
         self,
