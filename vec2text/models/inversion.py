@@ -267,7 +267,7 @@ class InversionModel(transformers.PreTrainedModel):
         Override generate to use beam search with normalized metrics.
         """
         generation_kwargs = copy.copy(generation_kwargs)  # Make a copy to edit
-        beam_width = generation_kwargs.pop("beam_width", 10)
+        beam_width = generation_kwargs.pop("beam_width", 50)
         max_length = self.max_seq_length
         embedding_check_interval = generation_kwargs.pop("embedding_check_interval", 5)
 
