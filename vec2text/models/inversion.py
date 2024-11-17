@@ -121,6 +121,9 @@ class InversionModel(transformers.PreTrainedModel):
         self.embeddings_from_layer_n = embeddings_from_layer_n
         self.noise_level = vars(config).get("embedder_gaussian_noise_level")
 
+        self.log_sigma_cos = nn.Parameter(torch.tensor(0.0))
+        self.log_sigma_mse = nn.Parameter(torch.tensor(0.0))
+
     def _freeze_encoder(self):
         freeze_params(self.encoder_decoder.encoder)
 

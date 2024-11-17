@@ -11,22 +11,18 @@ from vec2text.trainers.base import BaseTrainer
 class UncertaintyLoss(nn.Module):
     def __init__(self):
         super(UncertaintyLoss, self).__init__()
-        # Learnable log-variance parameters for uncertainty weighting
-        self.log_sigma_ce = nn.Parameter(torch.tensor(0.0))  # For cross-entropy loss
-        self.log_sigma_cosine_embedding = nn.Parameter(torch.tensor(0.0))  # For cosine embedding loss
-        self.log_sigma_mse_embedding = nn.Parameter(torch.tensor(0.0))  # For mse embedding loss
 
-    def forward(self, ce_loss, cosine_embedding_loss, mse_embedding_loss):
+    def forward(self, log_sigma_ce, log_sigma_cosine_embedding, log_sigma_mse_embedding, ce_loss, cosine_embedding_loss, mse_embedding_loss):
         # Compute uncertainties
-        sigma_ce = torch.exp(self.log_sigma_ce)
-        sigma_cosine_embedding = torch.exp(self.log_sigma_cosine_embedding)
-        sigma_mse_embedding = torch.exp(self.log_sigma_mse_embedding)
+        sigma_ce = torch.exp(log_sigma_ce)
+        sigma_cosine_embedding = torch.exp(log_sigma_cosine_embedding)
+        sigma_mse_embedding = torch.exp(log_sigma_mse_embedding)
 
 
         # Weighted total loss
-        weighted_ce_loss = ce_loss / (2 * sigma_ce**2) + self.log_sigma_ce
-        weighted_cosine_embedding_loss = cosine_embedding_loss / (2 * sigma_cosine_embedding**2) + self.log_sigma_cosine_embedding
-        weighted_mse_embedding_loss = mse_embedding_loss / (2 * sigma_mse_embedding**2) + self.log_sigma_mse_embedding
+        weighted_ce_loss = ce_loss / (2 * sigma_ce**2) + log_sigma_ce
+        weighted_cosine_embedding_loss = cosine_embedding_loss / (2 * sigma_cosine_embedding**2) + log_sigma_cosine_embedding
+        weighted_mse_embedding_loss = mse_embedding_loss / (2 * sigma_mse_embedding**2) + log_sigma_mse_embedding
 
         # Combine losses
         total_loss = weighted_ce_loss + weighted_cosine_embedding_loss + weighted_mse_embedding_loss
@@ -72,7 +68,7 @@ class InversionTrainer(BaseTrainer):
         cosine_embedding_loss = torch.tensor(0.0, device=ce_loss.device)
         mse_embedding_loss = torch.tensor(0.0, device=ce_loss.device)
 
-        params = list(self.model.parameters()) + list(self.uncertainty_loss.parameters())
+        params = list(self.model.parameters()) 
         self.optimizer = torch.optim.AdamW(params, lr=1e-3)
 
         # Compute embedding loss at specified intervals
@@ -126,7 +122,7 @@ class InversionTrainer(BaseTrainer):
         normalized_mse_embedding_loss = mse_embedding_loss / self.mse_embedding_running_mean
 
         # Use the uncertainty loss function to compute the total loss
-        total_loss, loss_info = self.uncertainty_loss(normalized_ce_loss, normalized_cosine_embedding_loss, normalized_mse_embedding_loss)
+        total_loss, loss_info = self.uncertainty_loss(self.model.log_sigma_ce, self.model.log_sigma_cosine_embedding, self.model.log_sigma_mse_embedding normalized_ce_loss, normalized_cosine_embedding_loss, normalized_mse_embedding_loss)
 
         # Log metrics
         self.log({
