@@ -48,9 +48,9 @@ class UncertaintyLoss(nn.Module):
             "weighted_ce_loss": weighted_ce_loss.detach().item(),
             "weighted_cosine_embedding_loss": weighted_cosine_embedding_loss.detach().item(),
             "weighted_mse_embedding_loss": weighted_mse_embedding_loss.detach().item(),
-            "log_sigma_ce": self.log_sigma_ce.detach().item(),
-            "log_sigma_cosine_embedding": self.log_sigma_cosine_embedding.detach().item(),
-            "log_sigma_mse_embedding": self.log_sigma_mse_embedding.detach().item(),
+            "log_sigma_ce": log_sigma_ce.detach().item(),
+            "log_sigma_cosine_embedding": log_sigma_cosine_embedding.detach().item(),
+            "log_sigma_mse_embedding": log_sigma_mse_embedding.detach().item(),
         }
 
 
