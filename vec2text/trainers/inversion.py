@@ -79,7 +79,7 @@ class InversionTrainer(BaseTrainer):
         }
 
         # Generate predictions
-        pred_ids = model.generate(
+        pred_ids = self.model.generate(
             inputs=inputs,
             generation_kwargs=generation_kwargs,
         )
