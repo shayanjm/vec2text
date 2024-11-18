@@ -124,7 +124,6 @@ class InversionModel(transformers.PreTrainedModel):
 
         self.log_sigma_ce = nn.Parameter(torch.tensor(0.0))
         self.log_sigma_cosine_embedding = nn.Parameter(torch.tensor(0.0))
-        self.log_sigma_mse_embedding = nn.Parameter(torch.tensor(0.0))
 
     def _freeze_encoder(self):
         freeze_params(self.encoder_decoder.encoder)
