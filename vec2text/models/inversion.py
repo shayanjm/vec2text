@@ -272,8 +272,8 @@ class InversionModel(transformers.PreTrainedModel):
         embedding_check_interval = generation_kwargs.pop("embedding_check_interval", 5)
 
         # Extract learned uncertainty parameters
-        sigma_cos2 = torch.exp(self.log_sigma_cos)
-        sigma_mse2 = torch.exp(self.log_sigma_mse)
+        sigma_cos2 = torch.exp(self.log_sigma_cosine_embedding)
+        sigma_mse2 = torch.exp(self.log_sigma_mse_embedding)
 
         # Fetch target embeddings
         target_embedding = inputs["frozen_embeddings"]
