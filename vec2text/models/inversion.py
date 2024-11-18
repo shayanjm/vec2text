@@ -266,22 +266,51 @@ class InversionModel(transformers.PreTrainedModel):
         """
         Override generate to use beam search with normalized metrics.
         """
+        # Determine the device
+        device = next(self.parameters()).device
+
         generation_kwargs = copy.copy(generation_kwargs)  # Make a copy to edit
-        #beam_width = generation_kwargs.pop("beam_width", 50)
         beam_width = 50
         max_length = self.max_seq_length
         embedding_check_interval = generation_kwargs.pop("embedding_check_interval", 5)
 
         # Extract learned uncertainty parameters
+        sigma_ce2 = torch.exp(self.log_sigma_ce)
         sigma_cos2 = torch.exp(self.log_sigma_cosine_embedding)
         sigma_mse2 = torch.exp(self.log_sigma_mse_embedding)
 
         # Fetch target embeddings
         target_embedding = inputs["frozen_embeddings"]
 
+        # Ensure bos_token_id is valid
+        bos_token_id = self.tokenizer.bos_token_id
+        if bos_token_id is None:
+            bos_token_id = self.tokenizer.cls_token_id
+        if bos_token_id is None:
+            bos_token_id = self.tokenizer.eos_token_id
+        if bos_token_id is None:
+            bos_token_id = self.tokenizer.pad_token_id
+        if bos_token_id is None:
+            raise ValueError("No valid bos_token_id found in the tokenizer.")
+
         # Initialize beams
-        beams = [{"tokens": [self.tokenizer.bos_token_id], "score": 0.0, "metrics": {}}]
+        beams = [{
+            "tokens": [bos_token_id],
+            "log_prob_sum": 0.0,
+            "ce": 0.0,  # Cross-entropy term
+            "metrics": {},
+            "score": 0.0  # Total score including all terms
+        }]
         completed_beams = []
+
+        # Ensure eos_token_id is valid
+        eos_token_id = self.tokenizer.eos_token_id
+        if eos_token_id is None:
+            eos_token_id = self.tokenizer.sep_token_id
+        if eos_token_id is None:
+            eos_token_id = self.tokenizer.pad_token_id
+        if eos_token_id is None:
+            raise ValueError("No valid eos_token_id found in the tokenizer.")
 
         for step in range(max_length):
             new_beams = []
@@ -289,28 +318,35 @@ class InversionModel(transformers.PreTrainedModel):
 
             for beam in beams:
                 tokens = beam["tokens"]
-                score = beam["score"]
+                log_prob_sum = beam["log_prob_sum"]
 
                 # Expand current beam
-                input_ids = torch.tensor([tokens], device=self.device)
+                input_ids = torch.tensor([tokens], device=device)
                 outputs = self.encoder_decoder(input_ids=input_ids)
                 logits = outputs.logits[:, -1, :]
-                next_token_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+                next_token_log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
 
                 # Take top-k tokens for beam expansion
-                top_k_probs, top_k_tokens = torch.topk(next_token_probs, beam_width, dim=-1)
+                top_k_log_probs, top_k_tokens = torch.topk(next_token_log_probs, beam_width, dim=-1)
 
-                for prob, token in zip(top_k_probs.squeeze(), top_k_tokens.squeeze()):
+                for log_prob, token in zip(top_k_log_probs.squeeze(), top_k_tokens.squeeze()):
                     new_tokens = tokens + [token.item()]
-                    new_score = score + prob.item()
+                    new_log_prob_sum = log_prob_sum + log_prob.item()
+                    new_ce = -new_log_prob_sum  # Cross-entropy is negative log probability sum
 
                     metrics = {}
                     # Periodically compute embedding metrics
                     if step % embedding_check_interval == 0 or step == max_length - 1:
                         partial_sequence = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
+                        pred_input_ids = self.tokenizer.encode(
+                            partial_sequence,
+                            return_tensors='pt',
+                            add_special_tokens=True
+                        ).to(device)
+                        pred_attention_mask = torch.ones_like(pred_input_ids).to(device)
                         pred_embedding = self.call_embedding_model(
-                            input_ids=torch.tensor([self.tokenizer.encode(partial_sequence)], device=self.device),
-                            attention_mask=torch.ones(len(new_tokens), device=self.device),
+                            input_ids=pred_input_ids,
+                            attention_mask=pred_attention_mask,
                         )
 
                         # Compute Cosine Similarity and MSE
@@ -325,40 +361,68 @@ class InversionModel(transformers.PreTrainedModel):
                         metric_values["cosine"].append(cosine_sim)
                         metric_values["mse"].append(mse)
 
-                    new_beams.append({"tokens": new_tokens, "score": new_score, "metrics": metrics})
+                    # Collect CE for normalization
+                    metric_values["ce"].append(new_ce)
+
+                    new_beams.append({
+                        "tokens": new_tokens,
+                        "log_prob_sum": new_log_prob_sum,
+                        "ce": new_ce,
+                        "metrics": metrics,
+                        "score": 0.0  # Will be updated after normalization
+                    })
 
             # Normalize metrics across beams
-            if step % embedding_check_interval == 0 or step == max_length - 1:
-                for metric in ["cosine", "mse"]:
-                    values = metric_values[metric]
-                    if len(values) > 1:  # Only normalize if multiple values exist
-                        min_val, max_val = min(values), max(values)
-                        for beam in new_beams:
-                            if metric in beam["metrics"]:
-                                normalized_value = (beam["metrics"][metric] - min_val) / (max_val - min_val + 1e-8)
-                                beam["metrics"][metric] = normalized_value
+            for metric in ["cosine", "mse", "ce"]:
+                values = metric_values[metric]
+                if len(values) > 0:
+                    min_val, max_val = min(values), max(values)
+                    # Avoid division by zero if all values are the same
+                    denom = max_val - min_val + 1e-8
+                    for beam in new_beams:
+                        if metric == "ce":
+                            normalized_value = (beam["ce"] - min_val) / denom
+                            beam["normalized_ce"] = normalized_value
+                        elif metric in beam["metrics"]:
+                            normalized_value = (beam["metrics"][metric] - min_val) / denom
+                            beam["metrics"][metric] = normalized_value
 
-            # Update scores with normalized metrics
+            # Update scores with uncertainty weighting
             for beam in new_beams:
+                total_score = 0.0
+
+                # Cross-Entropy Term (normalized)
+                total_score -= (1 / sigma_ce2) * beam["normalized_ce"]  # Minimize normalized CE
+
+                # Cosine Similarity Term (normalized)
                 if "cosine" in beam["metrics"]:
-                    beam["score"] += (1 / sigma_cos2) * beam["metrics"]["cosine"]
+                    total_score += (1 / sigma_cos2) * beam["metrics"]["cosine"]  # Maximize normalized cosine similarity
+
+                # MSE Term (normalized)
                 if "mse" in beam["metrics"]:
-                    beam["score"] -= (1 / sigma_mse2) * beam["metrics"]["mse"]
+                    total_score -= (1 / sigma_mse2) * beam["metrics"]["mse"]  # Minimize normalized MSE
+
+                beam["score"] = total_score
 
             # Prune to top-k beams
             beams = sorted(new_beams, key=lambda x: x["score"], reverse=True)[:beam_width]
 
             # Check for completed sequences
             for beam in beams:
-                if beam["tokens"][-1] == self.tokenizer.eos_token_id:
+                if beam["tokens"][-1] == eos_token_id:
                     completed_beams.append(beam)
 
             if len(completed_beams) >= beam_width:
                 break
 
+        # If no completed beams, take the best from current beams
+        if not completed_beams:
+            completed_beams = beams
+
         # Return the best sequence
-        best_sequence = sorted(completed_beams, key=lambda x: x["score"], reverse=True)[0]["tokens"]
-        return torch.tensor(best_sequence, device=self.device)
+        best_beam = sorted(completed_beams, key=lambda x: x["score"], reverse=True)[0]
+        best_sequence = best_beam["tokens"]
+        return torch.tensor(best_sequence, device=device)
 
     def forward(
         self,
