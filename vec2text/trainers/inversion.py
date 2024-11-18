@@ -70,36 +70,30 @@ class InversionTrainer(BaseTrainer):
         outputs = model(**inputs)
         ce_loss = outputs.loss  # Cross-entropy loss
 
-        cosine_embedding_loss = torch.tensor(0.0, device=ce_loss.device)
-
-        params = list(self.model.parameters())
-        self.optimizer = torch.optim.AdamW(params, lr=1e-3)
-
-        # Compute embedding loss at specified intervals
+        # Get logits and predicted ids
         logits = outputs.get("logits")
-        pred_ids = torch.argmax(logits, dim=-1).detach().cpu()
+        pred_ids = torch.argmax(logits, dim=-1).detach()
         pred_texts = self.tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
 
-        pred_embeddings = []
-        for text in pred_texts:
-            pred_inputs = self.embedder_tokenizer(
-                [text],
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=self.embedder_tokenizer.model_max_length,
-            ).to(ce_loss.device)
-            pred_embedding = self.call_embedding_model(
-                input_ids=pred_inputs["input_ids"],
-                attention_mask=pred_inputs["attention_mask"],
-            )
-        pred_embeddings.append(pred_embedding)
+        # Encode predicted texts using embedder_tokenizer
+        pred_inputs = self.embedder_tokenizer(
+            pred_texts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=self.embedder_tokenizer.model_max_length,
+        ).to(ce_loss.device)
 
-        pred_embeddings = torch.stack(pred_embeddings)
+        # Call the embedding model on the batch
+        pred_embeddings = self.call_embedding_model(
+            input_ids=pred_inputs["input_ids"],
+            attention_mask=pred_inputs["attention_mask"],
+        )
+
+        # Get target embeddings
         target_embeddings = inputs["frozen_embeddings"]
-        if pred_embeddings.shape != target_embeddings.shape:
-            pred_embeddings = pred_embeddings.view_as(target_embeddings)
 
+        # Compute cosine embedding loss
         cosine_embedding_loss = (
             1
             - nn.functional.cosine_similarity(
