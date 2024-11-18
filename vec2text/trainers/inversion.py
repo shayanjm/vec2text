@@ -70,9 +70,21 @@ class InversionTrainer(BaseTrainer):
         outputs = model(**inputs)
         ce_loss = outputs.loss  # Cross-entropy loss
 
-        # Get logits and predicted ids
-        logits = outputs.get("logits")
-        pred_ids = torch.argmax(logits, dim=-1).detach()
+        # Use the generate method to get the model's predictions
+        generation_kwargs = {
+            'max_length': self.model.config.max_seq_length,
+            'num_beams': 1,  # Use greedy decoding
+            'do_sample': False,  # Disable sampling
+            'early_stopping': True,
+        }
+
+        # Generate predictions
+        pred_ids = model.generate(
+            inputs=inputs,
+            generation_kwargs=generation_kwargs,
+        )
+
+        # Decode predicted tokens
         pred_texts = self.tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
 
         # Encode predicted texts using embedder_tokenizer
@@ -141,7 +153,7 @@ class InversionTrainer(BaseTrainer):
             }
         )
 
-        return (total_loss, outputs) if return_outputs else total_loss
+        return (total_loss, outputs) if return_outputs else total_loss 
 
     def generate(self, inputs: Dict, generation_kwargs: Dict) -> torch.Tensor:
         return self.model.generate(inputs=inputs, generation_kwargs=generation_kwargs)
