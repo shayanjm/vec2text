@@ -276,7 +276,6 @@ class InversionModel(transformers.PreTrainedModel):
         # Extract learned uncertainty parameters
         sigma_ce2 = torch.exp(self.log_sigma_ce)
         sigma_cos2 = torch.exp(self.log_sigma_cosine_embedding)
-        sigma_mse2 = torch.exp(self.log_sigma_mse_embedding)
 
         # Fetch target embeddings
         target_embedding = inputs["frozen_embeddings"]
@@ -313,7 +312,7 @@ class InversionModel(transformers.PreTrainedModel):
 
         for step in range(max_length):
             new_beams = []
-            metric_values = {"cosine": [], "mse": [], "ce": []}  # Collect metrics for normalization
+            metric_values = {"cosine": [], "ce": []}  # Collect metrics for normalization
 
             for beam in beams:
                 tokens = beam["tokens"]
@@ -348,17 +347,14 @@ class InversionModel(transformers.PreTrainedModel):
                             attention_mask=pred_attention_mask,
                         )
 
-                        # Compute Cosine Similarity and MSE
+                        # Compute Cosine Similarity 
                         cosine_sim = torch.nn.functional.cosine_similarity(
                             pred_embedding, target_embedding, dim=-1
                         ).mean().item()
-                        mse = torch.nn.functional.mse_loss(pred_embedding, target_embedding).item()
 
                         # Save metrics for normalization
                         metrics["cosine"] = cosine_sim
-                        metrics["mse"] = mse
                         metric_values["cosine"].append(cosine_sim)
-                        metric_values["mse"].append(mse)
 
                     # Collect CE for normalization
                     metric_values["ce"].append(new_ce)
@@ -372,7 +368,7 @@ class InversionModel(transformers.PreTrainedModel):
                     })
 
             # Normalize metrics across beams
-            for metric in ["cosine", "mse", "ce"]:
+            for metric in ["cosine", "ce"]:
                 values = metric_values[metric]
                 if len(values) > 0:
                     min_val, max_val = min(values), max(values)
@@ -396,10 +392,6 @@ class InversionModel(transformers.PreTrainedModel):
                 # Cosine Similarity Term (normalized)
                 if "cosine" in beam["metrics"]:
                     total_score += (1 / sigma_cos2) * beam["metrics"]["cosine"]  # Maximize normalized cosine similarity
-
-                # MSE Term (normalized)
-                if "mse" in beam["metrics"]:
-                    total_score -= (1 / sigma_mse2) * beam["metrics"]["mse"]  # Minimize normalized MSE
 
                 beam["score"] = total_score
 
