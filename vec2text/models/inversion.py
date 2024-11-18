@@ -280,6 +280,13 @@ class InversionModel(transformers.PreTrainedModel):
         # Fetch target embeddings
         target_embedding = inputs["frozen_embeddings"]
 
+        # Get the encoder inputs
+        inputs_embeds, attention_mask = self.embed_and_project(
+            embedder_input_ids=inputs["embedder_input_ids"],
+            embedder_attention_mask=inputs["embedder_attention_mask"],
+            frozen_embeddings=inputs.get("frozen_embeddings"),
+        )
+
         # Ensure bos_token_id is valid
         bos_token_id = self.tokenizer.bos_token_id
         if bos_token_id is None:
@@ -319,8 +326,12 @@ class InversionModel(transformers.PreTrainedModel):
                 log_prob_sum = beam["log_prob_sum"]
 
                 # Expand current beam
-                input_ids = torch.tensor([tokens], device=device)
-                outputs = self.encoder_decoder(input_ids=input_ids)
+                decoder_input_ids = torch.tensor([tokens], device=device)
+                outputs = self.encoder_decoder(
+                    inputs_embeds=inputs_embeds,
+                    attention_mask=attention_mask,
+                    decoder_input_ids=decoder_input_ids,
+                )
                 logits = outputs.logits[:, -1, :]
                 next_token_log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
 
