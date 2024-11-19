@@ -295,20 +295,34 @@ class InversionModel(transformers.PreTrainedModel):
         self,
         embedder_input_ids: torch.Tensor,
         embedder_attention_mask: torch.Tensor,
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
         frozen_embeddings: Optional[torch.Tensor] = None,
         decoder_input_ids: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Dict[str, torch.Tensor]:
         # Unused: input_ids, attention_mask
-        inputs_embeds, attention_mask = self.embed_and_project(
-            embedder_input_ids=embedder_input_ids,
-            embedder_attention_mask=embedder_attention_mask,
-            frozen_embeddings=frozen_embeddings,
-        )
-        return self.encoder_decoder(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            labels=labels,
-            decoder_input_ids=decoder_input_ids,
-        )
+
+        # Determine which embeddings to use
+        if input_ids is not None and attention_mask is not None:
+            # Use input_ids and attention_mask directly
+            return self.encoder_decoder(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+                decoder_input_ids=decoder_input_ids,
+            )
+        else:
+            # Use embed_and_project as before
+            inputs_embeds, attention_mask = self.embed_and_project(
+                embedder_input_ids=embedder_input_ids,
+                embedder_attention_mask=embedder_attention_mask,
+                frozen_embeddings=frozen_embeddings,
+            )
+            return self.encoder_decoder(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                labels=labels,
+                decoder_input_ids=decoder_input_ids,
+            )

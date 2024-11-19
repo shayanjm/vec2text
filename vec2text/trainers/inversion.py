@@ -48,7 +48,6 @@ class UncertaintyLoss(nn.Module):
 class InversionTrainer(BaseTrainer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.uncertainty_loss = UncertaintyLoss()
 
         self.embedding_loss_count = 0  # Track number of accumulated steps
         self.ce_running_mean = 1.0  # Initialize running mean for ce_loss
@@ -123,12 +122,7 @@ class InversionTrainer(BaseTrainer):
         decoder_input_ids = self.model.encoder_decoder._shift_right(generated_ids)
 
         # Call the model to get outputs
-        outputs = model(
-            input_ids=inputs['input_ids'],
-            attention_mask=inputs['attention_mask'],
-            decoder_input_ids=decoder_input_ids,
-            labels=labels,
-        )
+        outputs = model(**inputs)
 
         # Compute log probabilities
         # Sum the negative log likelihoods over the sequence
