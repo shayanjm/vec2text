@@ -72,7 +72,7 @@ class InversionTrainer(BaseTrainer):
 
         # Use the generate method to get the model's predictions
         generation_kwargs = {
-            'num_beams': 50, 
+            'num_beams': 25, 
             'use_cache': False,
         }
 
