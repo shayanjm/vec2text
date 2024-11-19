@@ -66,93 +66,103 @@ class InversionTrainer(BaseTrainer):
         self.embedder = self.model.embedder
 
     def compute_loss(self, model, inputs, return_outputs=False):
-        # Forward pass
-        outputs = model(**inputs)
-        ce_loss = outputs.loss  # Cross-entropy loss
+        device = inputs['input_ids'].device
+        batch_size = inputs['input_ids'].size(0)
+        target_embeddings = inputs['frozen_embeddings']  # Shape: (batch_size, embedding_dim)
 
-        # Use the generate method to get the model's predictions
+        # Generate sequences with sampling
         generation_kwargs = {
             'max_length': self.model.config.max_length,
-            'num_beams': 10, 
-            'use_cache': False,
+            'do_sample': True,
+            'top_k': 50,
+            'top_p': 0.95,
+            'num_return_sequences': 1,  # One sample per input in the batch
         }
-
-        # Generate predictions
-        pred_ids = self.model.generate(
+        generated_ids = self.model.generate(
             inputs=inputs,
             generation_kwargs=generation_kwargs,
         )
 
-        # Decode predicted tokens
-        pred_texts = self.tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
+        # Decode generated sequences
+        pred_texts = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
 
-        # Encode predicted texts using embedder_tokenizer
-        pred_inputs = self.embedder_tokenizer(
-            pred_texts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=self.embedder_tokenizer.model_max_length,
-        ).to(ce_loss.device)
+        # Compute rewards
+        rewards = []
+        for i in range(batch_size):
+            pred_text = pred_texts[i]
+            target_embedding = target_embeddings[i]
 
-        # Call the embedding model on the batch
-        pred_embeddings = self.call_embedding_model(
-            input_ids=pred_inputs["input_ids"],
-            attention_mask=pred_inputs["attention_mask"],
-        )
+            # Encode predicted text using embedder_tokenizer
+            pred_input = self.embedder_tokenizer(
+                pred_text,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=self.embedder_tokenizer.model_max_length,
+            ).to(device)
 
-        # Get target embeddings
-        target_embeddings = inputs["frozen_embeddings"]
+            # Call the embedding model on the text
+            pred_embedding = self.call_embedding_model(
+                input_ids=pred_input["input_ids"],
+                attention_mask=pred_input["attention_mask"],
+            )
 
-        # Compute cosine embedding loss
-        cosine_embedding_loss = (
-            1
-            - nn.functional.cosine_similarity(
-                pred_embeddings, target_embeddings, dim=-1
+            # Compute cosine similarity
+            cosine_sim = nn.functional.cosine_similarity(
+                pred_embedding, target_embedding.unsqueeze(0), dim=-1
             ).mean()
+            rewards.append(cosine_sim.item())
+
+        rewards = torch.tensor(rewards).to(device)
+
+        # Prepare labels and decoder_input_ids
+        labels = generated_ids.clone()
+        labels[labels == self.tokenizer.pad_token_id] = -100  # Mask padding tokens
+
+        # Shift generated_ids to create decoder_input_ids
+        decoder_input_ids = self.model.encoder_decoder._shift_right(generated_ids)
+
+        # Call the model to get outputs
+        outputs = model(
+            input_ids=inputs['input_ids'],
+            attention_mask=inputs['attention_mask'],
+            decoder_input_ids=decoder_input_ids,
+            labels=labels,
         )
 
-        # Update decaying window means
-        self.ce_batch_count += 1
-        self.ce_running_mean = (
-            self.ce_running_mean * (self.ce_batch_count - 1) + ce_loss.item()
-        ) / self.ce_batch_count
+        # Compute log probabilities
+        # Sum the negative log likelihoods over the sequence
+        loss_fct = nn.CrossEntropyLoss(ignore_index=-100, reduction='none')
+        logits = outputs.logits  # Shape: (batch_size, seq_length, vocab_size)
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = labels[:, 1:].contiguous()
 
-        self.cosine_embedding_batch_count += 1
-        self.cosine_embedding_running_mean = (
-            self.cosine_embedding_running_mean * (self.cosine_embedding_batch_count - 1)
-            + cosine_embedding_loss.item()
-        ) / self.cosine_embedding_batch_count
-
-        # Normalize losses using running means
-        normalized_ce_loss = ce_loss / self.ce_running_mean
-        normalized_cosine_embedding_loss = (
-            cosine_embedding_loss / self.cosine_embedding_running_mean
+        # Compute per-token losses
+        loss = loss_fct(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1)
         )
+        # Reshape back to (batch_size, seq_length - 1)
+        loss = loss.view(shift_labels.size())
 
-        # Use the uncertainty loss function to compute the total loss
-        total_loss, loss_info = self.uncertainty_loss(
-            self.model.log_sigma_ce,
-            self.model.log_sigma_cosine_embedding,
-            normalized_ce_loss,
-            normalized_cosine_embedding_loss,
-        )
+        # Sum over sequence length to get sequence log probabilities
+        log_probs = -loss.sum(dim=1)  # Shape: (batch_size,)
+
+        # Compute policy gradient loss
+        baseline = rewards.mean()
+        advantages = rewards - baseline
+
+        loss = - (advantages * log_probs).mean()
 
         # Log metrics
         self.log(
             {
-                "ce_loss": ce_loss.detach().item(),
-                "cosine_embedding_loss": cosine_embedding_loss.detach().item(),
-                "ce_running_mean": self.ce_running_mean,
-                "cosine_embedding_running_mean": self.cosine_embedding_running_mean,
-                "normalized_ce_loss": normalized_ce_loss.detach().item(),
-                "normalized_cosine_embedding_loss": normalized_cosine_embedding_loss.detach().item(),
-                "total_loss": total_loss.detach().item(),
-                **loss_info,
+                "average_reward": rewards.mean().item(),
+                "policy_loss": loss.detach().item(),
             }
         )
 
-        return (total_loss, outputs) if return_outputs else total_loss 
+        return (loss, outputs) if return_outputs else loss 
 
     def generate(self, inputs: Dict, generation_kwargs: Dict) -> torch.Tensor:
         return self.model.generate(inputs=inputs, generation_kwargs=generation_kwargs)
