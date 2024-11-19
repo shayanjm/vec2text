@@ -76,6 +76,7 @@ class InversionTrainer(BaseTrainer):
             'num_beams': 10, 
             'do_sample': False,  # Disable sampling
             'early_stopping': True,
+            'use_cache': False,
         }
 
         # Generate predictions
