@@ -140,7 +140,8 @@ class InversionTrainer(BaseTrainer):
 
         # Call the model to get outputs
         outputs = model(
-            **inputs,
+            input_ids=inputs["input_ids"],
+            attention_mask=inputs["attention_mask"],
             decoder_input_ids=decoder_input_ids,
             decoder_attention_mask=decoder_attention_mask,
             labels=labels,

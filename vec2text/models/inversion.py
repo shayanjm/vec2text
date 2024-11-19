@@ -293,8 +293,8 @@ class InversionModel(transformers.PreTrainedModel):
 
     def forward(
         self,
-        embedder_input_ids: torch.Tensor,
-        embedder_attention_mask: torch.Tensor,
+        embedder_input_ids: torch.Tensor = None,
+        embedder_attention_mask: torch.Tensor = None,
         input_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
