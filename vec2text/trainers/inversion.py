@@ -79,6 +79,7 @@ class InversionTrainer(BaseTrainer):
                 "top_k": 50,
                 "top_p": 0.95,
                 "num_return_sequences": 1,
+                # Note: Ensure that num_return_sequences aligns with batch_size if needed
             }
             generated_ids = self.model.generate(
                 inputs=inputs,
@@ -120,7 +121,7 @@ class InversionTrainer(BaseTrainer):
             ).mean()
             rewards.append(cosine_sim.item())
 
-        rewards = torch.tensor(rewards).to(device)
+        rewards = torch.tensor(rewards, dtype=torch.float32, device=device)
 
         # Prepare labels and decoder_input_ids
         labels = generated_ids.clone()
@@ -155,13 +156,15 @@ class InversionTrainer(BaseTrainer):
         seq_length = labels.size(1)
         logits = logits[:, :seq_length, :]
 
-        shift_logits = logits[:, :-1, :].contiguous()
-        shift_labels = labels[:, 1:].contiguous()
+        shift_logits = logits[
+            :, :-1, :
+        ].contiguous()  # (batch_size, seq_length -1, vocab_size)
+        shift_labels = labels[:, 1:].contiguous()  # (batch_size, seq_length -1)
 
         # Compute per-token losses
         loss = loss_fct(
             shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
-        )
+        )  # Shape: (batch_size * (seq_length -1))
 
         # Create loss mask
         loss_mask = (shift_labels.view(-1) != -100).float()
@@ -169,13 +172,21 @@ class InversionTrainer(BaseTrainer):
         # Apply the loss mask
         loss = loss * loss_mask
 
-        # Sum over valid tokens
-        log_probs = -loss.sum(dim=0) / loss_mask.sum(dim=0)
+        # Reshape loss and mask back to (batch_size, seq_length -1)
+        loss = loss.view(batch_size, -1)
+        loss_mask = loss_mask.view(batch_size, -1)
+
+        # Sum over valid tokens per sequence to get log probabilities per sequence
+        log_probs = -(loss.sum(dim=1) / loss_mask.sum(dim=1))  # Shape: (batch_size,)
 
         # Compute policy gradient loss
         baseline = rewards.mean()
         advantages = rewards - baseline
 
+        # Normalize advantages
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        # Compute the final loss
         loss = -(advantages * log_probs).mean()
 
         # Log metrics
@@ -183,6 +194,9 @@ class InversionTrainer(BaseTrainer):
             {
                 "average_reward": rewards.mean().item(),
                 "policy_loss": loss.detach().item(),
+                "advantages_mean": advantages.mean().item(),
+                "advantages_std": advantages.std().item(),
+                "log_probs_mean": log_probs.mean().item(),
             }
         )
 
