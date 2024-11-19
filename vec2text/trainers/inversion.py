@@ -32,10 +32,7 @@ class UncertaintyLoss(nn.Module):
         )
 
         # Combine losses
-        total_loss = (
-            weighted_ce_loss
-            + weighted_cosine_embedding_loss
-        )
+        total_loss = weighted_ce_loss + weighted_cosine_embedding_loss
 
         return total_loss, {
             "weighted_ce_loss": weighted_ce_loss.detach().item(),
@@ -65,9 +62,11 @@ class InversionTrainer(BaseTrainer):
         self.embedder = self.model.embedder
 
     def compute_loss(self, model, inputs, return_outputs=False):
-        device = inputs['input_ids'].device
-        batch_size = inputs['input_ids'].size(0)
-        target_embeddings = inputs["frozen_embeddings"]  # Shape: (batch_size, embedding_dim)
+        device = inputs["input_ids"].device
+        batch_size = inputs["input_ids"].size(0)
+        target_embeddings = inputs[
+            "frozen_embeddings"
+        ]  # Shape: (batch_size, embedding_dim)
 
         # Set model to evaluation mode for generation
         model.eval()
@@ -75,11 +74,11 @@ class InversionTrainer(BaseTrainer):
         with torch.no_grad():
             # Generate sequences with sampling
             generation_kwargs = {
-                'max_length': self.model.config.max_length,
-                'do_sample': True,
-                'top_k': 50,
-                'top_p': 0.95,
-                'num_return_sequences': 1,
+                "max_length": self.model.config.max_length,
+                "do_sample": True,
+                "top_k": 50,
+                "top_p": 0.95,
+                "num_return_sequences": 1,
             }
             generated_ids = self.model.generate(
                 inputs=inputs,
@@ -90,7 +89,9 @@ class InversionTrainer(BaseTrainer):
         model.train()
 
         # Decode generated sequences
-        pred_texts = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+        pred_texts = self.tokenizer.batch_decode(
+            generated_ids, skip_special_tokens=True
+        )
 
         # Compute rewards
         rewards = []
@@ -133,19 +134,20 @@ class InversionTrainer(BaseTrainer):
         decoder_input_ids = decoder_input_ids[:, :max_seq_length]
 
         # Create decoder_attention_mask
-        decoder_attention_mask = (decoder_input_ids != self.tokenizer.pad_token_id).long()
+        decoder_attention_mask = (
+            decoder_input_ids != self.tokenizer.pad_token_id
+        ).long()
 
         # Call the model to get outputs
         outputs = model(
-            input_ids=inputs['input_ids'],
-            attention_mask=inputs['attention_mask'],
+            **inputs,
             decoder_input_ids=decoder_input_ids,
             decoder_attention_mask=decoder_attention_mask,
             labels=labels,
         )
 
         # Compute log probabilities
-        loss_fct = nn.CrossEntropyLoss(ignore_index=-100, reduction='none')
+        loss_fct = nn.CrossEntropyLoss(ignore_index=-100, reduction="none")
         logits = outputs.logits  # Shape: (batch_size, seq_length, vocab_size)
 
         # Ensure logits and labels have the same sequence length
@@ -157,8 +159,7 @@ class InversionTrainer(BaseTrainer):
 
         # Compute per-token losses
         loss = loss_fct(
-            shift_logits.view(-1, shift_logits.size(-1)),
-            shift_labels.view(-1)
+            shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
         )
 
         # Create loss mask
@@ -174,7 +175,7 @@ class InversionTrainer(BaseTrainer):
         baseline = rewards.mean()
         advantages = rewards - baseline
 
-        loss = - (advantages * log_probs).mean()
+        loss = -(advantages * log_probs).mean()
 
         # Log metrics
         self.log(
