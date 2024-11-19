@@ -67,20 +67,27 @@ class InversionTrainer(BaseTrainer):
     def compute_loss(self, model, inputs, return_outputs=False):
         device = inputs['input_ids'].device
         batch_size = inputs['input_ids'].size(0)
-        target_embeddings = inputs['frozen_embeddings']  # Shape: (batch_size, embedding_dim)
+        target_embeddings = inputs["frozen_embeddings"]  # Shape: (batch_size, embedding_dim)
 
-        # Generate sequences with sampling
-        generation_kwargs = {
-            'max_length': self.model.config.max_length,
-            'do_sample': True,
-            'top_k': 50,
-            'top_p': 0.95,
-            'num_return_sequences': 1,  # One sample per input in the batch
-        }
-        generated_ids = self.model.generate(
-            inputs=inputs,
-            generation_kwargs=generation_kwargs,
-        )
+        # Set model to evaluation mode for generation
+        model.eval()
+
+        with torch.no_grad():
+            # Generate sequences with sampling
+            generation_kwargs = {
+                'max_length': self.model.config.max_length,
+                'do_sample': True,
+                'top_k': 50,
+                'top_p': 0.95,
+                'num_return_sequences': 1,
+            }
+            generated_ids = self.model.generate(
+                inputs=inputs,
+                generation_kwargs=generation_kwargs,
+            )
+
+        # Set model back to training mode
+        model.train()
 
         # Decode generated sequences
         pred_texts = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
@@ -118,16 +125,33 @@ class InversionTrainer(BaseTrainer):
         labels = generated_ids.clone()
         labels[labels == self.tokenizer.pad_token_id] = -100  # Mask padding tokens
 
-        # Shift generated_ids to create decoder_input_ids
-        decoder_input_ids = self.model.encoder_decoder._shift_right(generated_ids)
+        # Shift labels to create decoder_input_ids
+        decoder_input_ids = self.model.encoder_decoder._shift_right(labels)
+
+        # Ensure decoder_input_ids and labels have the same length
+        max_seq_length = labels.size(1)
+        decoder_input_ids = decoder_input_ids[:, :max_seq_length]
+
+        # Create decoder_attention_mask
+        decoder_attention_mask = (decoder_input_ids != self.tokenizer.pad_token_id).long()
 
         # Call the model to get outputs
-        outputs = model(**inputs)
+        outputs = model(
+            input_ids=inputs['input_ids'],
+            attention_mask=inputs['attention_mask'],
+            decoder_input_ids=decoder_input_ids,
+            decoder_attention_mask=decoder_attention_mask,
+            labels=labels,
+        )
 
         # Compute log probabilities
-        # Sum the negative log likelihoods over the sequence
         loss_fct = nn.CrossEntropyLoss(ignore_index=-100, reduction='none')
         logits = outputs.logits  # Shape: (batch_size, seq_length, vocab_size)
+
+        # Ensure logits and labels have the same sequence length
+        seq_length = labels.size(1)
+        logits = logits[:, :seq_length, :]
+
         shift_logits = logits[:, :-1, :].contiguous()
         shift_labels = labels[:, 1:].contiguous()
 
@@ -136,11 +160,15 @@ class InversionTrainer(BaseTrainer):
             shift_logits.view(-1, shift_logits.size(-1)),
             shift_labels.view(-1)
         )
-        # Reshape back to (batch_size, seq_length - 1)
-        loss = loss.view(shift_labels.size())
 
-        # Sum over sequence length to get sequence log probabilities
-        log_probs = -loss.sum(dim=1)  # Shape: (batch_size,)
+        # Create loss mask
+        loss_mask = (shift_labels.view(-1) != -100).float()
+
+        # Apply the loss mask
+        loss = loss * loss_mask
+
+        # Sum over valid tokens
+        log_probs = -loss.sum(dim=0) / loss_mask.sum(dim=0)
 
         # Compute policy gradient loss
         baseline = rewards.mean()
@@ -156,7 +184,7 @@ class InversionTrainer(BaseTrainer):
             }
         )
 
-        return (loss, outputs) if return_outputs else loss 
+        return (loss, outputs) if return_outputs else loss
 
     def generate(self, inputs: Dict, generation_kwargs: Dict) -> torch.Tensor:
         return self.model.generate(inputs=inputs, generation_kwargs=generation_kwargs)
