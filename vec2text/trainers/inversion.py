@@ -72,10 +72,7 @@ class InversionTrainer(BaseTrainer):
 
         # Use the generate method to get the model's predictions
         generation_kwargs = {
-            'max_length': self.model.config.max_seq_length,
             'num_beams': 1, 
-            'do_sample': False,  # Disable sampling
-            'early_stopping': True,
             'use_cache': False,
         }
 
