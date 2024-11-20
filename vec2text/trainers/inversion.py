@@ -128,30 +128,26 @@ class InversionTrainer(BaseTrainer):
         labels[labels == self.tokenizer.pad_token_id] = -100  # Mask padding tokens
 
         # Pad/truncate preds (generated_ids) and labels to max_seq_length
-        if generated_ids.size(1) < self.model.max_seq_length:
+        if generated_ids.size(1) < self.model.config.max_seq_length:
             generated_ids = nn.functional.pad(
                 generated_ids,
-                (0, self.model.max_seq_length - generated_ids.size(1)),
+                (0, self.model.config.max_seq_length - generated_ids.size(1)),
                 value=self.tokenizer.pad_token_id,
             )
         else:
-            generated_ids = generated_ids[:, :self.model.max_seq_length]
+            generated_ids = generated_ids[:, :self.model.config.max_seq_length]
 
-        if labels.size(1) < self.model.max_seq_length:
+        if labels.size(1) < self.model.config.max_seq_length:
             labels = nn.functional.pad(
                 labels,
-                (0, self.model.max_seq_length - labels.size(1)),
+                (0, self.model.config.max_seq_length - labels.size(1)),
                 value=-100,
             )
         else:
-            labels = labels[:, :self.model.max_seq_length]
+            labels = labels[:, :self.model.config.max_seq_length]
 
         # Shift labels to create decoder_input_ids
         decoder_input_ids = self.model.encoder_decoder._shift_right(labels)
-
-        # Ensure decoder_input_ids and labels have the same length
-        max_seq_length = labels.size(1)
-        decoder_input_ids = decoder_input_ids[:, :max_seq_length]
 
         # Create decoder_attention_mask
         decoder_attention_mask = (
