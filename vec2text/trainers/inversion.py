@@ -106,7 +106,7 @@ class InversionTrainer(BaseTrainer):
                 return_tensors="pt",
                 padding=True,
                 truncation=True,
-                max_length=self.embedder_tokenizer.model_max_length,
+                max_length=self.model.config.max_length,
             ).to(device)
 
             # Call the embedding model on the text
