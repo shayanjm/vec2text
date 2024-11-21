@@ -239,6 +239,9 @@ class InversionTrainer(BaseTrainer):
 
         Override to compute ppl from eval loss.
         """
+        # Explicitly set model to evaluation mode
+        self.model.eval()
+
         output = super().evaluation_loop(*args, **kwargs)
 
         metric_key_prefix = kwargs["metric_key_prefix"]
@@ -249,6 +252,9 @@ class InversionTrainer(BaseTrainer):
         except OverflowError:
             perplexity = float("inf")
         output.metrics[f"{metric_key_prefix}_perplexity"] = perplexity
+
+        # Restore to training mode after evaluation
+        self.model.train()
 
         return output
 
