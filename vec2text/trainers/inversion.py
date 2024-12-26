@@ -65,10 +65,8 @@ class InversionTrainer(BaseTrainer):
         self.embedder = self.model.embedder
 
         self.ppo_config = PPOConfig(
-            model_name=self.model.config.model_name_or_path,
-            learning_rate=self.args.learning_rate,  # or separate LR for PPO
-            batch_size=self.args.per_device_train_batch_size,
-            # Additional PPO hyperparams here...
+            num_ppo_epochs=4,
+            kl_coef=0.05,
         )
 
         self.ref_model = deepcopy(self.model.encoder_decoder).eval()
@@ -78,6 +76,7 @@ class InversionTrainer(BaseTrainer):
             model=self.model.encoder_decoder,  # policy
             ref_model=self.ref_model,
             tokenizer=self.tokenizer,
+            batch_size=self.args.per_device_train_batch_size,
         )
 
     def compute_loss(self, model, inputs, return_outputs=False):
