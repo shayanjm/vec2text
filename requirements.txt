@@ -13,3 +13,4 @@ tenacity
 tokenizers
 tqdm
 transformers==4.45.2
+trl==0.13.0
