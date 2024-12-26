@@ -156,8 +156,7 @@ class InversionTrainer(BaseTrainer):
 
         # Call the model to get outputs
         outputs = model(
-            input_ids=inputs["input_ids"],
-            attention_mask=inputs["attention_mask"],
+            frozen_embeddings=inputs["frozen_embeddings"],
             decoder_input_ids=decoder_input_ids,
             decoder_attention_mask=decoder_attention_mask,
             labels=labels,
