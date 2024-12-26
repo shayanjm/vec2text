@@ -120,23 +120,90 @@ def tokenize_function_llama_chat(
 
 
 def embed_dataset_batch(model: InversionModel, batch: Dict) -> Dict:
-    assert "input_ids" in batch.keys(), f"invalid keys {batch.keys()}"
+    # Basic checks
+    assert "input_ids" in batch, f"invalid keys {batch.keys()}"
     assert hasattr(model, "call_embedding_model")
 
-    input_ids = batch["input_ids"]
+    # The raw input_ids are from model.tokenizer. We'll decode them to get strings:
+    input_ids = batch["input_ids"]  # shape: (batch_size, seq_len)
     inputs_str = model.tokenizer.batch_decode(input_ids, skip_special_tokens=True)
-    emb_input_ids = model.embedder_tokenizer(
-        inputs_str,
-        max_length=model.config.max_seq_length,
-        truncation=True,
-        padding="max_length",
-        return_tensors="pt",
-    ).to(next(model.parameters()).device)
 
-    with torch.no_grad():
-        batch["frozen_embeddings"] = model.call_embedding_model(**emb_input_ids)
+    # We'll store the final embeddings in this list.
+    # Each item will be either a np.array of shape (embed_dim,) or (num_chunks, embed_dim).
+    all_frozen_embs = []
+
+    # For chunking config:
+    embedding_strategy = model.config.embedding_transform_strategy
+    chunk_size = getattr(model.config, "chunk_size", 128)
+    chunk_overlap = getattr(model.config, "chunk_overlap", 16)
+
+    # For each example in the batch:
+    for text_str in inputs_str:
+        # 1) Convert text -> tokens for the embedder.
+        # We'll do no max_length truncation or we do it at a large enough limit 
+        # so we can properly chunk. If you keep `max_length`, ensure it's bigger 
+        # than chunk_size if you want multiple chunks.
+        emb_input = model.embedder_tokenizer(
+            text_str,
+            # If you do want to limit, set a bigger max_length than chunk_size.
+            max_length=model.config.max_seq_length,
+            truncation=False, 
+            padding=False,
+            return_tensors="pt",
+        ).to(next(model.parameters()).device)
+
+        # If we're using overlap_chunking, we do manual chunking across token_ids
+        if embedding_strategy == "overlap_chunking":
+            # Extract the tokenized IDs for chunking
+            token_ids = emb_input["input_ids"].squeeze(0)       # shape: (seq_len,)
+            token_mask = emb_input["attention_mask"].squeeze(0) # shape: (seq_len,)
+
+            chunk_embs = []
+            start = 0
+            while start < token_ids.size(0):
+                end = min(start + chunk_size, token_ids.size(0))
+                chunk_ids = token_ids[start:end]
+                chunk_attention = token_mask[start:end]
+
+                # We must wrap them back into batch form for call_embedding_model
+                chunk_ids = chunk_ids.unsqueeze(0)           # (1, chunk_len)
+                chunk_attention = chunk_attention.unsqueeze(0)
+
+                with torch.no_grad():
+                    # call_embedding_model returns (1, embed_dim) if it’s a pooled embedding
+                    chunk_embedding = model.call_embedding_model(
+                        input_ids=chunk_ids,
+                        attention_mask=chunk_attention,
+                    )
+                    # shape: (1, embed_dim)
+                chunk_embs.append(chunk_embedding.squeeze(0))  # => (embed_dim,)
+
+                # step forward by chunk_size - overlap
+                step_size = chunk_size - chunk_overlap
+                if step_size <= 0:
+                    raise ValueError("chunk_overlap must be smaller than chunk_size.")
+                start += step_size
+
+            if len(chunk_embs) == 0:
+                # Handle edge case of empty input
+                chunk_embs = [torch.zeros(model.embedder_dim, device="cpu")]
+
+            # Stack => (num_chunks, embed_dim)
+            chunk_embs_stacked = torch.stack(chunk_embs, dim=0)
+            # Move to CPU numpy if you want
+            all_frozen_embs.append(chunk_embs_stacked.cpu().numpy())
+
+        else:
+            # Fallback: the old single pooled embedding approach
+            with torch.no_grad():
+                # shape => (1, embed_dim)
+                single_emb = model.call_embedding_model(**emb_input)
+            # store shape => (embed_dim,)
+            all_frozen_embs.append(single_emb.squeeze(0).cpu().numpy())
+
+    # Now we have a list of embeddings, each either shape (embed_dim,) or (num_chunks, embed_dim).
+    batch["frozen_embeddings"] = all_frozen_embs
     return batch
-
 
 def get_tokenizer_mapping(
     lm: str, inverter: str, inverter_vocab_size: int

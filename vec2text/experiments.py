@@ -418,6 +418,9 @@ class Experiment(abc.ABC):
             print(
                 f"[Precomputing embeddings with batch size: {self.training_args.per_device_train_batch_size}]"
             )
+            print(
+                f"[Using transform strategy {self.model_args.embedder_transform_strategy}]"
+            )
             assert torch.cuda.is_available()
             model = model.to(device)
 
