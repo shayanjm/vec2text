@@ -273,6 +273,12 @@ class TrainingArguments(transformers.TrainingArguments):
         default=False,
         metadata={"help": ("Whether to use bf16 (mixed) precision instead of 32-bit.")},
     )
+    supervised_training: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to use supervised training or RL"
+        },
+    )
     # torch_compile: bool = True # for torch 2
 
     ##################### Experimental Settings ####################
