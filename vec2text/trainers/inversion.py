@@ -14,30 +14,25 @@ class UncertaintyLoss(nn.Module):
         # Learnable log-variance parameters for uncertainty weighting
         self.log_sigma_ce = nn.Parameter(torch.tensor(0.0))  # For cross-entropy loss
         self.log_sigma_cosine_embedding = nn.Parameter(torch.tensor(0.0))  # For cosine embedding loss
-        self.log_sigma_mse_embedding = nn.Parameter(torch.tensor(0.0))  # For mse embedding loss
 
-    def forward(self, ce_loss, cosine_embedding_loss, mse_embedding_loss):
+    def forward(self, ce_loss, cosine_embedding_loss):
         # Compute uncertainties
         sigma_ce = torch.exp(self.log_sigma_ce)
         sigma_cosine_embedding = torch.exp(self.log_sigma_cosine_embedding)
-        sigma_mse_embedding = torch.exp(self.log_sigma_mse_embedding)
 
 
         # Weighted total loss
         weighted_ce_loss = ce_loss / (2 * sigma_ce**2) + self.log_sigma_ce
         weighted_cosine_embedding_loss = cosine_embedding_loss / (2 * sigma_cosine_embedding**2) + self.log_sigma_cosine_embedding
-        weighted_mse_embedding_loss = mse_embedding_loss / (2 * sigma_mse_embedding**2) + self.log_sigma_mse_embedding
 
         # Combine losses
-        total_loss = weighted_ce_loss + weighted_cosine_embedding_loss + weighted_mse_embedding_loss
+        total_loss = weighted_ce_loss + weighted_cosine_embedding_loss 
 
         return total_loss, {
             'weighted_ce_loss': weighted_ce_loss.detach().item(),
             'weighted_cosine_embedding_loss': weighted_cosine_embedding_loss.detach().item(),
-            'weighted_mse_embedding_loss': weighted_mse_embedding_loss.detach().item(),
             'log_sigma_ce': self.log_sigma_ce.detach().item(),
             'log_sigma_cosine_embedding': self.log_sigma_embedding.detach().item(),
-            'log_sigma_mse_embedding': self.log_sigma_mse_embedding.detach().item(),
         }
 
 class InversionTrainer(BaseTrainer):
@@ -53,8 +48,6 @@ class InversionTrainer(BaseTrainer):
         self.ce_batch_count = 0  # Track number of batches for ce_loss
         self.cosine_embedding_running_mean = 1.0  # Initialize running mean for cosine_embedding_loss
         self.cosine_embedding_batch_count = 0  # Track number of batches for cosine_embedding_loss
-        self.mse_embedding_running_mean = 1.0  # Initialize running mean for mse_embedding_loss
-        self.mse_embedding_batch_count = 0  # Track number of batches for mse_embedding_loss
         # Initialize cache using OrderedDict for LRU functionality
         self.embedding_cache = OrderedDict()
         self.cache_hits = 0
@@ -70,7 +63,6 @@ class InversionTrainer(BaseTrainer):
         ce_loss = outputs.loss  # Cross-entropy loss
 
         cosine_embedding_loss = torch.tensor(0.0, device=ce_loss.device)
-        mse_embedding_loss = torch.tensor(0.0, device=ce_loss.device)
 
         params = list(self.model.parameters()) + list(self.uncertainty_loss.parameters())
         self.optimizer = torch.optim.AdamW(params, lr=1e-3)
@@ -108,7 +100,6 @@ class InversionTrainer(BaseTrainer):
             pred_embeddings = pred_embeddings.view_as(target_embeddings)
         
         cosine_embedding_loss = 1 - nn.functional.cosine_similarity(pred_embeddings, target_embeddings, dim=-1).mean()
-        mse_embedding_loss = nn.functional.mse_loss(pred_embeddings, target_embeddings)
 
         # Update decaying window means
         self.ce_batch_count += 1
@@ -117,28 +108,21 @@ class InversionTrainer(BaseTrainer):
         self.cosine_embedding_batch_count += 1
         self.cosine_embedding_running_mean = (self.cosine_embedding_running_mean * (self.cosine_embedding_batch_count - 1) + cosine_embedding_loss.item()) / self.cosine_embedding_batch_count
 
-        self.mse_embedding_batch_count += 1
-        self.mse_embedding_running_mean = (self.mse_embedding_running_mean * (self.mse_embedding_batch_count - 1) + mse_embedding_loss.item()) / self.mse_embedding_batch_count
-
         # Normalize losses using running means
         normalized_ce_loss = ce_loss / self.ce_running_mean
         normalized_cosine_embedding_loss = cosine_embedding_loss / self.cosine_embedding_running_mean
-        normalized_mse_embedding_loss = mse_embedding_loss / self.mse_embedding_running_mean
 
         # Use the uncertainty loss function to compute the total loss
-        total_loss, loss_info = self.uncertainty_loss(normalized_ce_loss, normalized_cosine_embedding_loss, normalized_mse_embedding_loss)
+        total_loss, loss_info = self.uncertainty_loss(normalized_ce_loss, normalized_cosine_embedding_loss)
 
         # Log metrics
         self.log({
             'ce_loss': ce_loss.detach().item(),
             'cosine_embedding_loss': cosine_embedding_loss.detach().item(),
-            'mse_embedding_loss': mse_embedding_loss.detach().item(),
             'ce_running_mean': self.ce_running_mean,
             'cosine_embedding_running_mean': self.cosine_embedding_running_mean,
-            'mse_embedding_running_mean': self.mse_embedding_running_mean,
             'normalized_ce_loss': normalized_ce_loss.detach().item(),
             'normalized_cosine_embedding_loss': normalized_cosine_embedding_loss.detach().item(),
-            'normalized_mse_embedding_loss': normalized_mse_embedding_loss.detach().item(),
             'total_loss': total_loss.detach().item(),
             **loss_info,
             'cache_hits': self.cache_hits
