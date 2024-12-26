@@ -162,8 +162,7 @@ class BaseTrainer(transformers.Trainer):
         Probably want custom eval eventually. Also this depends on eval data being
         in the same order which is annoying.
         """
-        was_training = self.model.training
-        self.model.eval()  # Ensure evaluation mode
+        assert not self.model.training
 
         gen_kwargs = copy.copy(self.gen_kwargs)
 
@@ -210,9 +209,6 @@ class BaseTrainer(transformers.Trainer):
             all_labels.extend(true_input_ids.cpu().tolist())
             if len(all_preds) >= n:
                 break
-        
-        if was_training:
-            self.model.train()
 
         return all_preds, all_labels
 

@@ -6,138 +6,145 @@ import torch
 import torch.nn as nn
 import transformers
 
-from trl import PPOConfig, PPOTrainer
-from copy import deepcopy
-
 from vec2text.trainers.base import BaseTrainer
-
 
 class UncertaintyLoss(nn.Module):
     def __init__(self):
         super(UncertaintyLoss, self).__init__()
+        # Learnable log-variance parameters for uncertainty weighting
+        self.log_sigma_ce = nn.Parameter(torch.tensor(0.0))  # For cross-entropy loss
+        self.log_sigma_cosine_embedding = nn.Parameter(torch.tensor(0.0))  # For cosine embedding loss
+        self.log_sigma_mse_embedding = nn.Parameter(torch.tensor(0.0))  # For mse embedding loss
 
-    def forward(
-        self,
-        log_sigma_ce,
-        log_sigma_cosine_embedding,
-        ce_loss,
-        cosine_embedding_loss,
-    ):
+    def forward(self, ce_loss, cosine_embedding_loss, mse_embedding_loss):
         # Compute uncertainties
-        sigma_ce = torch.exp(log_sigma_ce)
-        sigma_cosine_embedding = torch.exp(log_sigma_cosine_embedding)
+        sigma_ce = torch.exp(self.log_sigma_ce)
+        sigma_cosine_embedding = torch.exp(self.log_sigma_cosine_embedding)
+        sigma_mse_embedding = torch.exp(self.log_sigma_mse_embedding)
+
 
         # Weighted total loss
-        weighted_ce_loss = ce_loss / (2 * sigma_ce**2) + log_sigma_ce
-        weighted_cosine_embedding_loss = (
-            cosine_embedding_loss / (2 * sigma_cosine_embedding**2)
-            + log_sigma_cosine_embedding
-        )
+        weighted_ce_loss = ce_loss / (2 * sigma_ce**2) + self.log_sigma_ce
+        weighted_cosine_embedding_loss = cosine_embedding_loss / (2 * sigma_cosine_embedding**2) + self.log_sigma_cosine_embedding
+        weighted_mse_embedding_loss = mse_embedding_loss / (2 * sigma_mse_embedding**2) + self.log_sigma_mse_embedding
 
         # Combine losses
-        total_loss = weighted_ce_loss + weighted_cosine_embedding_loss
+        total_loss = weighted_ce_loss + weighted_cosine_embedding_loss + weighted_mse_embedding_loss
 
         return total_loss, {
-            "weighted_ce_loss": weighted_ce_loss.detach().item(),
-            "weighted_cosine_embedding_loss": weighted_cosine_embedding_loss.detach().item(),
-            "log_sigma_ce": log_sigma_ce.detach().item(),
-            "log_sigma_cosine_embedding": log_sigma_cosine_embedding.detach().item(),
+            'weighted_ce_loss': weighted_ce_loss.detach().item(),
+            'weighted_cosine_embedding_loss': weighted_cosine_embedding_loss.detach().item(),
+            'weighted_mse_embedding_loss': weighted_mse_embedding_loss.detach().item(),
+            'log_sigma_ce': self.log_sigma_ce.detach().item(),
+            'log_sigma_cosine_embedding': self.log_sigma_embedding.detach().item(),
+            'log_sigma_mse_embedding': self.log_sigma_mse_embedding.detach().item(),
         }
 
-
 class InversionTrainer(BaseTrainer):
-    def __init__(self, *args, **kwargs):
+    def __init__(
+        self, *args, max_cache_size=10000, **kwargs
+    ):
         super().__init__(*args, **kwargs)
+        self.uncertainty_loss = UncertaintyLoss()
 
+        self.max_cache_size = max_cache_size
         self.embedding_loss_count = 0  # Track number of accumulated steps
         self.ce_running_mean = 1.0  # Initialize running mean for ce_loss
         self.ce_batch_count = 0  # Track number of batches for ce_loss
-        self.cosine_embedding_running_mean = (
-            1.0  # Initialize running mean for cosine_embedding_loss
-        )
-        self.cosine_embedding_batch_count = (
-            0  # Track number of batches for cosine_embedding_loss
-        )
+        self.cosine_embedding_running_mean = 1.0  # Initialize running mean for cosine_embedding_loss
+        self.cosine_embedding_batch_count = 0  # Track number of batches for cosine_embedding_loss
+        self.mse_embedding_running_mean = 1.0  # Initialize running mean for mse_embedding_loss
+        self.mse_embedding_batch_count = 0  # Track number of batches for mse_embedding_loss
+        # Initialize cache using OrderedDict for LRU functionality
+        self.embedding_cache = OrderedDict()
+        self.cache_hits = 0
         # Existing initializations
         self.tokenizer = self.model.tokenizer
         self.embedder_tokenizer = self.model.embedder_tokenizer
         self.call_embedding_model = self.model.call_embedding_model
         self.embedder = self.model.embedder
 
-        self.ppo_config = PPOConfig(
-            num_ppo_epochs=4,
-            kl_coef=0.05,
-        )
-
-        self.ref_model = deepcopy(self.model.encoder_decoder).eval()
-         # Create the PPOTrainer with your T5-value-head policy
-        self.ppo_trainer = PPOTrainer(
-            config=self.ppo_config,
-            model=self.model.encoder_decoder,  # policy
-            ref_model=self.ref_model,
-            tokenizer=self.tokenizer,
-            batch_size=self.args.per_device_train_batch_size,
-        )
-
     def compute_loss(self, model, inputs, return_outputs=False):
-        # --------------------------------------------------------------------------------
-        # TRL PPO logic
-        # --------------------------------------------------------------------------------
-        device = inputs["frozen_embeddings"].device
-        batch_size = inputs["frozen_embeddings"].size(0)
+        # Forward pass
+        outputs = model(**inputs)
+        ce_loss = outputs.loss  # Cross-entropy loss
 
-        # 1) Generate using the current policy
-        generation_kwargs = {
-            "max_length": self.model.config.max_length,
-            "do_sample": True,
-            "top_k": 50,
-            "top_p": 0.95,
-        }
-        generated_ids = self.model.generate(inputs=inputs, generation_kwargs=generation_kwargs)
-        generated_texts = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+        cosine_embedding_loss = torch.tensor(0.0, device=ce_loss.device)
+        mse_embedding_loss = torch.tensor(0.0, device=ce_loss.device)
 
-        # 2) Compute reward as e.g. cosine similarity with target embeddings
-        rewards = []
-        for i in range(batch_size):
-            pred_text = generated_texts[i]
-            tgt_emb = inputs["frozen_embeddings"][i]
+        params = list(self.model.parameters()) + list(self.uncertainty_loss.parameters())
+        self.optimizer = torch.optim.AdamW(params, lr=1e-3)
 
-            # embed predicted text
-            enc = self.embedder_tokenizer(
-                pred_text,
-                return_tensors="pt",
-                truncation=True,
-                max_length=self.model.config.max_length,
-            ).to(device)
-            pred_emb = self.call_embedding_model(
-                input_ids=enc["input_ids"],
-                attention_mask=enc["attention_mask"],
-            )
-            cos_sim = nn.functional.cosine_similarity(pred_emb, tgt_emb.unsqueeze(0), dim=-1)
-            rewards.append(cos_sim.item())
-        rewards = torch.tensor(rewards, dtype=torch.float32, device=device)
+        # Compute embedding loss at specified intervals
+        logits = outputs.get("logits")
+        pred_ids = torch.argmax(logits, dim=-1).detach().cpu()
+        pred_texts = self.tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
 
-        # 3) PPO step => queries = input prompt, responses = generated text
-        # For T5, the "query" is typically the encoder input. E.g.:
-        queries = inputs["input_ids"]  # or "embedder_input_ids" if your main input is embedder-based
-        responses = generated_ids
+        pred_embeddings = []
+        for text in pred_texts:
+            if text in self.embedding_cache:
+                pred_embedding = self.embedding_cache[text].to(ce_loss.device)
+                self.cache_hits += 1
+            else:
+                pred_inputs = self.embedder_tokenizer(
+                    [text],
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=self.embedder_tokenizer.model_max_length,
+                ).to(ce_loss.device)
+                pred_embedding = self.call_embedding_model(
+                    input_ids=pred_inputs["input_ids"],
+                    attention_mask=pred_inputs["attention_mask"],
+                )
+                self.embedding_cache[text] = pred_embedding.detach().cpu()
+                if len(self.embedding_cache) > self.max_cache_size:
+                    self.embedding_cache.popitem(last=False)
+            pred_embeddings.append(pred_embedding)
 
-        # step returns a stats dict with PPO training info
-        stats = self.ppo_trainer.step(queries, responses, rewards)
+        pred_embeddings = torch.stack(pred_embeddings)
+        target_embeddings = inputs["frozen_embeddings"]
+        if pred_embeddings.shape != target_embeddings.shape:
+            pred_embeddings = pred_embeddings.view_as(target_embeddings)
+        
+        cosine_embedding_loss = 1 - nn.functional.cosine_similarity(pred_embeddings, target_embeddings, dim=-1).mean()
+        mse_embedding_loss = nn.functional.mse_loss(pred_embeddings, target_embeddings)
 
-        # HF Trainer expects a scalar loss to backprop
-        # TRL's .step() already does the PPO backprop update, so we can return 0
-        # or return stats["ppo/total_loss"] if you prefer to log some numeric value
-        ppo_loss = stats.get("objective/kl", 0.0)
-        final_loss = torch.tensor(ppo_loss).float().to(device)
+        # Update decaying window means
+        self.ce_batch_count += 1
+        self.ce_running_mean = (self.ce_running_mean * (self.ce_batch_count - 1) + ce_loss.item()) / self.ce_batch_count
 
-        # log stats
+        self.cosine_embedding_batch_count += 1
+        self.cosine_embedding_running_mean = (self.cosine_embedding_running_mean * (self.cosine_embedding_batch_count - 1) + cosine_embedding_loss.item()) / self.cosine_embedding_batch_count
+
+        self.mse_embedding_batch_count += 1
+        self.mse_embedding_running_mean = (self.mse_embedding_running_mean * (self.mse_embedding_batch_count - 1) + mse_embedding_loss.item()) / self.mse_embedding_batch_count
+
+        # Normalize losses using running means
+        normalized_ce_loss = ce_loss / self.ce_running_mean
+        normalized_cosine_embedding_loss = cosine_embedding_loss / self.cosine_embedding_running_mean
+        normalized_mse_embedding_loss = mse_embedding_loss / self.mse_embedding_running_mean
+
+        # Use the uncertainty loss function to compute the total loss
+        total_loss, loss_info = self.uncertainty_loss(normalized_ce_loss, normalized_cosine_embedding_loss, normalized_mse_embedding_loss)
+
+        # Log metrics
         self.log({
-            "train/ppo_loss": ppo_loss,
-            "train/reward_mean": rewards.mean().item(),
+            'ce_loss': ce_loss.detach().item(),
+            'cosine_embedding_loss': cosine_embedding_loss.detach().item(),
+            'mse_embedding_loss': mse_embedding_loss.detach().item(),
+            'ce_running_mean': self.ce_running_mean,
+            'cosine_embedding_running_mean': self.cosine_embedding_running_mean,
+            'mse_embedding_running_mean': self.mse_embedding_running_mean,
+            'normalized_ce_loss': normalized_ce_loss.detach().item(),
+            'normalized_cosine_embedding_loss': normalized_cosine_embedding_loss.detach().item(),
+            'normalized_mse_embedding_loss': normalized_mse_embedding_loss.detach().item(),
+            'total_loss': total_loss.detach().item(),
+            **loss_info,
+            'cache_hits': self.cache_hits
         })
 
-        return (final_loss, None) if return_outputs else final_loss
+        return (total_loss, outputs) if return_outputs else total_loss
 
     def generate(self, inputs: Dict, generation_kwargs: Dict) -> torch.Tensor:
         return self.model.generate(inputs=inputs, generation_kwargs=generation_kwargs)
@@ -161,9 +168,6 @@ class InversionTrainer(BaseTrainer):
 
         Override to compute ppl from eval loss.
         """
-        # Explicitly set model to evaluation mode
-        self.model.eval()
-
         output = super().evaluation_loop(*args, **kwargs)
 
         metric_key_prefix = kwargs["metric_key_prefix"]
@@ -174,9 +178,6 @@ class InversionTrainer(BaseTrainer):
         except OverflowError:
             perplexity = float("inf")
         output.metrics[f"{metric_key_prefix}_perplexity"] = perplexity
-
-        # Restore to training mode after evaluation
-        self.model.train()
 
         return output
 
