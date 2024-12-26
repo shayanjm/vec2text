@@ -65,9 +65,9 @@ class InversionModel(nn.Module):
 
         # Possibly freeze dropout, etc.
         if encoder_dropout_disabled:
-            disable_dropout(self.encoder_decoder.model.encoder)
+            disable_dropout(self.encoder_decoder.encoder)
         if decoder_dropout_disabled:
-            disable_dropout(self.encoder_decoder.model.decoder)
+            disable_dropout(self.encoder_decoder.decoder)
             disable_dropout(self.encoder_decoder.lm_head)
 
         # store embedder
@@ -87,13 +87,13 @@ class InversionModel(nn.Module):
             self.embedder_dim = embedder.config.hidden_size
 
         # If we want a distinct transform from embedding -> T5 hidden states:
-        encoder_hidden_dim = self.encoder_decoder.model.config.d_model
+        encoder_hidden_dim = self.encoder_decoder.config.d_model
         bottleneck_dim = self.embedder_dim  # or something else
         self.bottleneck_dim = bottleneck_dim
 
         self.embedding_transform = nn.Sequential(
             nn.Linear(self.embedder_dim, bottleneck_dim),
-            nn.Dropout(self.encoder_decoder.model.config.dropout_rate),
+            nn.Dropout(self.encoder_decoder.config.dropout_rate),
             nn.GELU(),
             nn.Linear(bottleneck_dim, encoder_hidden_dim * self.num_repeat_tokens),
         )
@@ -119,17 +119,17 @@ class InversionModel(nn.Module):
         elif freeze_strategy == "encoder_and_decoder":
             self._freeze_encoder()
             self._freeze_decoder()
-            freeze_params(self.encoder_decoder.model.shared)
+            freeze_params(self.encoder_decoder.shared)
         elif freeze_strategy == "none":
             pass
         else:
             raise ValueError(f"invalid freezing strategy {freeze_strategy}")
 
     def _freeze_encoder(self):
-        freeze_params(self.encoder_decoder.model.encoder)
+        freeze_params(self.encoder_decoder.encoder)
 
     def _freeze_decoder(self):
-        freeze_params(self.encoder_decoder.model.decoder)
+        freeze_params(self.encoder_decoder.decoder)
         freeze_params(self.encoder_decoder.lm_head)
 
     @property
