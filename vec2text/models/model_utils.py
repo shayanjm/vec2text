@@ -35,7 +35,7 @@ EMBEDDER_MODEL_NAMES = [
 
 
 FREEZE_STRATEGIES = ["decoder", "encoder_and_decoder", "encoder", "none"]
-EMBEDDING_TRANSFORM_STRATEGIES = ["repeat"]
+EMBEDDING_TRANSFORM_STRATEGIES = ["repeat", "overlap_chunking"]
 
 
 def get_device():

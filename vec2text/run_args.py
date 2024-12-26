@@ -71,6 +71,24 @@ class ModelArguments:
             "choices": EMBEDDING_TRANSFORM_STRATEGIES,
         },
     )
+    chunk_size: int = field(
+        default=128,
+        metadata={
+            "help": (
+                "If embedding_transform_strategy='overlap_chunking', the chunk_size to use "
+                "for chunk-based embedding."
+            )
+        },
+    )
+    chunk_overlap: int = field(
+        default=16,
+        metadata={
+            "help": (
+                "If embedding_transform_strategy='overlap_chunking', how many tokens of overlap "
+                "we include between consecutive chunks."
+            )
+        },
+    )
     encoder_dropout_disabled: bool = field(
         default=False, metadata={"help": "Disable dropout on T5 encoder"}
     )

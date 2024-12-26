@@ -92,12 +92,6 @@ class InversionModel(transformers.PreTrainedModel):
         self.use_frozen_embeddings_as_input = use_frozen_embeddings_as_input
         self.bottleneck_dim = bottleneck_dim
 
-        self.embedding_transform = nn.Sequential(
-            nn.Linear(self.embedder_dim, bottleneck_dim),
-            nn.Dropout(self.encoder_decoder.config.dropout_rate),
-            nn.GELU(),  # TODO consider dropout or normalization here.
-            nn.Linear(bottleneck_dim, encoder_hidden_dim * num_repeat_tokens),
-        )
         if encoder_dropout_disabled:
             disable_dropout(self.encoder_decoder.encoder)
         if decoder_dropout_disabled:
@@ -117,9 +111,28 @@ class InversionModel(transformers.PreTrainedModel):
         # self.freeze(freeze_strategy=config.freeze_strategy)
         self.embedder_fake_with_zeros = embedder_fake_with_zeros
 
-        self.embedding_transform_strategy = "repeat"  # "none" # "repeat"
+        self.embedding_transform_strategy = config.embedding_transform_strategy
+        self.chunk_size = config.chunk_size
+        self.chunk_overlap = config.chunk_overlap
         self.embeddings_from_layer_n = embeddings_from_layer_n
         self.noise_level = vars(config).get("embedder_gaussian_noise_level")
+
+        if self.embedding_transform_strategy == "overlap_chunking":
+            # For chunk-based approach
+            self.embedding_transform = nn.Sequential(
+                nn.Linear(self.embedder_dim, encoder_hidden_dim),
+                nn.Dropout(self.encoder_decoder.config.dropout_rate),
+                nn.GELU(),
+                nn.LayerNorm(encoder_hidden_dim),
+            )
+        else:
+            # Fallback to the old "repeat" bridging
+            self.embedding_transform = nn.Sequential(
+                nn.Linear(self.embedder_dim, bottleneck_dim),
+                nn.Dropout(self.encoder_decoder.config.dropout_rate),
+                nn.GELU(),
+                nn.Linear(bottleneck_dim, encoder_hidden_dim * num_repeat_tokens),
+            )
 
     def _freeze_encoder(self):
         freeze_params(self.encoder_decoder.encoder)
@@ -128,6 +141,54 @@ class InversionModel(transformers.PreTrainedModel):
         # github.com/huggingface/transformers/blob/master/src/transformers/models/t5/modeling_t5.py#L1229-L1231
         freeze_params(self.encoder_decoder.decoder)
         freeze_params(self.encoder_decoder.lm_head)
+
+    def _chunk_and_embed(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Splits each sequence in (input_ids, attention_mask) into overlapping chunks,
+        calls the embedding model on each chunk, and returns a
+        (batch_size, num_chunks, embedder_dim) tensor of chunk embeddings.
+        """
+        batch_size, full_seq_len = input_ids.shape
+        chunk_size = self.chunk_size
+        overlap = self.chunk_overlap
+
+        all_chunk_embeddings = []
+        start = 0
+        while start < full_seq_len:
+            end = start + chunk_size
+            if end > full_seq_len:
+                end = full_seq_len
+
+            # Slice out chunk
+            chunk_ids = input_ids[:, start:end]
+            chunk_mask = attention_mask[:, start:end]
+
+            # Call your existing code to embed
+            chunk_embedding = self.call_embedding_model(
+                input_ids=chunk_ids, attention_mask=chunk_mask
+            )
+            # shape => (batch_size, embedder_dim)
+            all_chunk_embeddings.append(chunk_embedding.unsqueeze(1))
+
+            # Move forward by chunk_size - overlap
+            step_size = max(1, chunk_size - overlap)
+            start += step_size
+
+            if start >= full_seq_len:
+                break
+
+        if len(all_chunk_embeddings) == 0:
+            return torch.zeros(
+                (batch_size, 1, self.embedder_dim),
+                dtype=torch.float32,
+                device=self.embedder_device,
+            )
+
+        return torch.cat(all_chunk_embeddings, dim=1)  # => (batch_size, num_chunks, embedder_dim)
 
     def freeze(self, freeze_strategy: str):
         assert freeze_strategy in FREEZE_STRATEGIES
@@ -217,41 +278,108 @@ class InversionModel(transformers.PreTrainedModel):
         embedder_attention_mask: Optional[torch.Tensor],
         frozen_embeddings: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # print("** embed_and_project")
-        assert not ((embedder_input_ids is None) and (frozen_embeddings is None))
+        """
+        Produces T5 encoder inputs: (batch_size, seq_len, hidden_dim)
+        plus an attention mask of shape (batch_size, seq_len).
+
+        If 'frozen_embeddings' is provided, we skip calling the embedder and just project
+        those embeddings. Otherwise, we either:
+        1) do overlap chunking (if self.embedding_transform_strategy == 'overlap_chunking'),
+        2) do repeat-based strategy (if 'repeat'),
+        3) or raise an error if unknown.
+        """
+
+        # -------------------------------------------------------------------------
+        # 1) If we have frozen embeddings, we assume they've either been pre-chunked
+        #    or are single vectors. We handle them directly and skip calling embedder.
+        # -------------------------------------------------------------------------
         if frozen_embeddings is not None:
+            # e.g. shape might be (batch_size, embed_dim) or (batch_size, num_chunks, embed_dim).
             embeddings = frozen_embeddings
-            assert len(embeddings.shape) == 2  # batch by d
-        elif self.embedder_no_grad:
-            with torch.no_grad():
+            # If you only stored single-vector embeddings, that means it's shape (B, embed_dim).
+            # If you stored them chunked, you'd have (B, num_chunks, embed_dim).
+            # We'll handle the dimension logic inside the strategy check below.
+        else:
+            # Actually embed from input_ids
+            if self.embedder_no_grad:
+                with torch.no_grad():
+                    embeddings = self.call_embedding_model(
+                        input_ids=embedder_input_ids,
+                        attention_mask=embedder_attention_mask,
+                    )
+            else:
                 embeddings = self.call_embedding_model(
                     input_ids=embedder_input_ids,
                     attention_mask=embedder_attention_mask,
                 )
-        else:
-            embeddings = self.call_embedding_model(
-                input_ids=embedder_input_ids,
-                attention_mask=embedder_attention_mask,
+
+        # Make sure we're matching the model's dtype, if needed
+        if embeddings.dtype != self.dtype:
+            embeddings = embeddings.to(self.dtype)
+
+        # -------------------------------------------------------------------------
+        # 2) Transform the embeddings into a sequence that T5 can attend over
+        # -------------------------------------------------------------------------
+        if self.embedding_transform_strategy == "overlap_chunking":
+            # (A) Overlap-chunking approach
+            # If we have 'frozen_embeddings' pre-chunked, it might already be shape
+            # (batch_size, num_chunks, embed_dim). If so, skip the chunk function.
+            # Otherwise, we do chunking from input_ids. 
+            if frozen_embeddings is not None:
+                # We expect shape (B, num_chunks, embed_dim). 
+                # If it's only (B, embed_dim), you'd need to handle that differently or raise an error.
+                if len(embeddings.shape) == 2:
+                    raise ValueError(
+                        "For overlap_chunking with frozen embeddings, pass them in chunked form: (B, num_chunks, embed_dim)."
+                    )
+                chunked_embeddings = embeddings  # shape => (B, num_chunks, embed_dim)
+            else:
+                # Use your chunking helper to convert (B, seq_len) => (B, num_chunks, embed_dim)
+                chunked_embeddings = self._chunk_and_embed(
+                    embedder_input_ids, embedder_attention_mask
+                )
+                # 'embeddings' from call_embedding_model(...) is not used directly here,
+                # because chunking means we do multiple calls inside _chunk_and_embed.
+
+            B, N, E = chunked_embeddings.shape  # batch, num_chunks, embed_dim
+            # Flatten chunk dimension for an MLP pass
+            flat_chunked = chunked_embeddings.reshape(B * N, E)
+
+            # Pass through bridging MLP, which outputs hidden_dim
+            transformed_2d = self.embedding_transform(flat_chunked)
+            # => shape: (B*N, hidden_dim)
+
+            # Reshape to (batch_size, num_chunks, hidden_dim)
+            final_embeddings = transformed_2d.reshape(B, N, -1)
+
+            # Build an attention mask: 1 means "attend to this chunk"
+            attention_mask = torch.ones(
+                (B, N), dtype=torch.long, device=final_embeddings.device
             )
-        if self.embedding_transform_strategy == "repeat":
-            if embeddings.dtype != self.dtype:
-                embeddings = embeddings.to(self.dtype)
+
+        elif self.embedding_transform_strategy == "repeat":
+            # (B) Old logic: single embedding => repeat
+            # embeddings => shape (batch_size, embed_dim)
+            # self.embedding_transform => yields (batch_size, hidden_dim * num_repeat_tokens)
             repeated_embeddings = self.embedding_transform(embeddings)
-            # linear outputs a big embedding, reshape into a sequence of regular size embeddings.
-            embeddings = repeated_embeddings.reshape(
+            # Reshape to (batch_size, num_repeat_tokens, hidden_dim)
+            final_embeddings = repeated_embeddings.reshape(
                 (*repeated_embeddings.shape[:-1], self.num_repeat_tokens, -1)
             )
-        elif self.embedding_transform_strategy == "nearest_neighbors":
-            # TODO
-            raise NotImplementedError()
-        else:
-            raise ValueError(
-                f"unknown embedding transformation strategy {self.embedding_transform_strategy}"
+            # Build attention mask
+            attention_mask = torch.ones(
+                (final_embeddings.shape[0], final_embeddings.shape[1]),
+                dtype=torch.long,
+                device=final_embeddings.device,
             )
-        attention_mask = torch.ones(
-            (embeddings.shape[0], embeddings.shape[1]), device=embeddings.device
-        )
-        return embeddings, attention_mask
+
+        else:
+            # Unknown strategy
+            raise ValueError(
+                f"Unknown embedding_transform_strategy: {self.embedding_transform_strategy}"
+            )
+
+        return final_embeddings, attention_mask
 
     def generate(
         self,

@@ -1,6 +1,5 @@
 import math
 from typing import Dict
-from collections import OrderedDict
 
 import torch
 import torch.nn as nn
@@ -37,20 +36,16 @@ class UncertaintyLoss(nn.Module):
 
 class InversionTrainer(BaseTrainer):
     def __init__(
-        self, *args, max_cache_size=10000, **kwargs
+        self, *args, **kwargs
     ):
         super().__init__(*args, **kwargs)
         self.uncertainty_loss = UncertaintyLoss()
 
-        self.max_cache_size = max_cache_size
         self.embedding_loss_count = 0  # Track number of accumulated steps
         self.ce_running_mean = 1.0  # Initialize running mean for ce_loss
         self.ce_batch_count = 0  # Track number of batches for ce_loss
         self.cosine_embedding_running_mean = 1.0  # Initialize running mean for cosine_embedding_loss
         self.cosine_embedding_batch_count = 0  # Track number of batches for cosine_embedding_loss
-        # Initialize cache using OrderedDict for LRU functionality
-        self.embedding_cache = OrderedDict()
-        self.cache_hits = 0
         # Existing initializations
         self.tokenizer = self.model.tokenizer
         self.embedder_tokenizer = self.model.embedder_tokenizer
@@ -74,24 +69,17 @@ class InversionTrainer(BaseTrainer):
 
         pred_embeddings = []
         for text in pred_texts:
-            if text in self.embedding_cache:
-                pred_embedding = self.embedding_cache[text].to(ce_loss.device)
-                self.cache_hits += 1
-            else:
-                pred_inputs = self.embedder_tokenizer(
-                    [text],
-                    return_tensors="pt",
-                    padding=True,
-                    truncation=True,
-                    max_length=self.embedder_tokenizer.model_max_length,
-                ).to(ce_loss.device)
-                pred_embedding = self.call_embedding_model(
-                    input_ids=pred_inputs["input_ids"],
-                    attention_mask=pred_inputs["attention_mask"],
-                )
-                self.embedding_cache[text] = pred_embedding.detach().cpu()
-                if len(self.embedding_cache) > self.max_cache_size:
-                    self.embedding_cache.popitem(last=False)
+            pred_inputs = self.embedder_tokenizer(
+                [text],
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=self.embedder_tokenizer.model_max_length,
+            ).to(ce_loss.device)
+            pred_embedding = self.call_embedding_model(
+                input_ids=pred_inputs["input_ids"],
+                attention_mask=pred_inputs["attention_mask"],
+            )
             pred_embeddings.append(pred_embedding)
 
         pred_embeddings = torch.stack(pred_embeddings)
@@ -125,7 +113,6 @@ class InversionTrainer(BaseTrainer):
             'normalized_cosine_embedding_loss': normalized_cosine_embedding_loss.detach().item(),
             'total_loss': total_loss.detach().item(),
             **loss_info,
-            'cache_hits': self.cache_hits
         })
 
         return (total_loss, outputs) if return_outputs else total_loss
