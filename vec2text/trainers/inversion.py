@@ -57,35 +57,49 @@ class InversionTrainer(BaseTrainer):
         outputs = model(**inputs)
         ce_loss = outputs.loss  # Cross-entropy loss
 
+        # Initialize cosine embedding loss
+        cosine_embedding_loss = torch.tensor(0.0, device=ce_loss.device)
+
+        # Include parameters from both model and uncertainty loss for optimization
+        params = list(self.model.parameters()) + list(self.uncertainty_loss.parameters())
+        self.optimizer = torch.optim.AdamW(params, lr=1e-3)
+
+        # Compute embedding loss at specified intervals
         logits = outputs.get("logits")
         pred_ids = torch.argmax(logits, dim=-1).detach().cpu()
         pred_texts = self.tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
 
-        # Get predicted embeddings
+        # Compute predicted embeddings
         pred_embeddings = []
         for text in pred_texts:
-            pred_inputs = self.embedder_tokenizer(
-                [text],
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=self.embedder_tokenizer.model_max_length,
-            ).to(ce_loss.device)
-            pred_embedding = self.call_embedding_model(
-                input_ids=pred_inputs["input_ids"],
-                attention_mask=pred_inputs["attention_mask"],
-            )
+            if text in self.embedding_cache:
+                pred_embedding = self.embedding_cache[text].to(ce_loss.device)
+                self.cache_hits += 1
+            else:
+                pred_inputs = self.embedder_tokenizer(
+                    [text],
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=self.embedder_tokenizer.model_max_length,
+                ).to(ce_loss.device)
+                pred_embedding = self.call_embedding_model(
+                    input_ids=pred_inputs["input_ids"],
+                    attention_mask=pred_inputs["attention_mask"],
+                )
+                self.embedding_cache[text] = pred_embedding.detach().cpu()
+                if len(self.embedding_cache) > self.max_cache_size:
+                    self.embedding_cache.popitem(last=False)
             pred_embeddings.append(pred_embedding)
 
         pred_embeddings = torch.stack(pred_embeddings)
 
-        # Target embeddings from dataset
+        # Get target embeddings
         target_embeddings = inputs["frozen_embeddings"]
 
-        # Check the embedding strategy
+        # Handle embedding strategies
         embedding_strategy = self.model.config.embedding_transform_strategy
         if embedding_strategy == "overlap_chunking":
-            # Handle chunked embeddings (target and/or predicted)
             if target_embeddings.dim() == 3:  # Chunked target embeddings: (batch_size, num_chunks, embed_dim)
                 target_embeddings = target_embeddings.mean(dim=1)  # Mean pooling
             if pred_embeddings.dim() == 3:  # Chunked predicted embeddings: (batch_size, num_chunks, embed_dim)
@@ -96,7 +110,7 @@ class InversionTrainer(BaseTrainer):
         else:
             raise ValueError(f"Unsupported embedding_transform_strategy: {embedding_strategy}")
 
-        # Assert that shapes are now aligned
+        # Ensure shapes are aligned
         assert pred_embeddings.shape == target_embeddings.shape, (
             f"Shape mismatch: pred_embeddings.shape={pred_embeddings.shape}, "
             f"target_embeddings.shape={target_embeddings.shape}"
@@ -105,7 +119,7 @@ class InversionTrainer(BaseTrainer):
         # Compute cosine similarity loss
         cosine_embedding_loss = 1 - nn.functional.cosine_similarity(pred_embeddings, target_embeddings, dim=-1).mean()
 
-        # Update running means for normalization
+        # Update decaying window means
         self.ce_batch_count += 1
         self.ce_running_mean = (self.ce_running_mean * (self.ce_batch_count - 1) + ce_loss.item()) / self.ce_batch_count
 
@@ -131,10 +145,12 @@ class InversionTrainer(BaseTrainer):
             'normalized_ce_loss': normalized_ce_loss.detach().item(),
             'normalized_cosine_embedding_loss': normalized_cosine_embedding_loss.detach().item(),
             'total_loss': total_loss.detach().item(),
-            **loss_info,  # Includes learnable log-variances
+            **loss_info,  # Includes weighted losses and log-variance parameters
+            'cache_hits': self.cache_hits
         })
 
         return (total_loss, outputs) if return_outputs else total_loss
+
 
 
     def generate(self, inputs: Dict, generation_kwargs: Dict) -> torch.Tensor:
