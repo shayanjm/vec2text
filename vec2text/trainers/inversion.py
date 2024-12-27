@@ -83,7 +83,7 @@ class InversionTrainer(BaseTrainer):
                 input_ids=pred_inputs["input_ids"],
                 attention_mask=pred_inputs["attention_mask"],
             )
-        pred_embeddings.append(pred_embedding)
+            pred_embeddings.append(pred_embedding)
 
         pred_embeddings = torch.stack(pred_embeddings)
 
