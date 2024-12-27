@@ -71,6 +71,15 @@ class ModelArguments:
             "choices": EMBEDDING_TRANSFORM_STRATEGIES,
         },
     )
+    max_num_chunks: int = field(
+        default=10,
+        metadata={
+            "help": (
+                "If embedding_transform_strategy='overlap_chunking', the maximum number of chunks to use "
+                "for chunk-based embedding."
+            )
+        },
+    )
     chunk_size: int = field(
         default=128,
         metadata={

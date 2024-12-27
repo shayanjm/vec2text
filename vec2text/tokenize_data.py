@@ -119,7 +119,15 @@ def tokenize_function_llama_chat(
     return tokenize_function_inner
 
 
-def embed_dataset_batch(model: InversionModel, batch: Dict) -> Dict:
+def embed_dataset_batch(model, batch: Dict) -> Dict:
+    """
+    Pre-compute frozen embeddings for each example in `batch`.
+    If `model.config.embedding_transform_strategy == "overlap_chunking"`, 
+    produce shape (num_chunks, embed_dim) for each example, then 
+    PAD/TRUNCATE to (max_num_chunks, embed_dim). 
+    Otherwise, produce shape (embed_dim,) as before.
+    """
+
     # Basic checks
     assert "input_ids" in batch, f"invalid keys {batch.keys()}"
     assert hasattr(model, "call_embedding_model")
@@ -129,7 +137,8 @@ def embed_dataset_batch(model: InversionModel, batch: Dict) -> Dict:
     inputs_str = model.tokenizer.batch_decode(input_ids, skip_special_tokens=True)
 
     # We'll store the final embeddings in this list.
-    # Each item will be either a np.array of shape (embed_dim,) or (num_chunks, embed_dim).
+    # Each item will be a numpy array of shape (embed_dim,) [old strategy]
+    # or (max_num_chunks, embed_dim) [overlap_chunking with pad/trunc].
     all_frozen_embs = []
 
     # For chunking config:
@@ -137,22 +146,19 @@ def embed_dataset_batch(model: InversionModel, batch: Dict) -> Dict:
     chunk_size = getattr(model.config, "chunk_size", 128)
     chunk_overlap = getattr(model.config, "chunk_overlap", 16)
 
-    # For each example in the batch:
+    # -- NEW: define how many chunks we want to keep per example --
+    # If your dataset can handle up to 10 chunks, for example:
+    max_num_chunks = getattr(model.config, "max_num_chunks", 10)
+
     for text_str in inputs_str:
         # 1) Convert text -> tokens for the embedder.
-        # We'll do no max_length truncation or we do it at a large enough limit 
-        # so we can properly chunk. If you keep `max_length`, ensure it's bigger 
-        # than chunk_size if you want multiple chunks.
         emb_input = model.embedder_tokenizer(
             text_str,
-            # If you do want to limit, set a bigger max_length than chunk_size.
-            max_length=model.config.max_seq_length,
-            truncation=False, 
+            truncation=False,    # let us see the entire sequence so we can chunk fully
             padding=False,
             return_tensors="pt",
         ).to(next(model.parameters()).device)
 
-        # If we're using overlap_chunking, we do manual chunking across token_ids
         if embedding_strategy == "overlap_chunking":
             # Extract the tokenized IDs for chunking
             token_ids = emb_input["input_ids"].squeeze(0)       # shape: (seq_len,)
@@ -165,43 +171,58 @@ def embed_dataset_batch(model: InversionModel, batch: Dict) -> Dict:
                 chunk_ids = token_ids[start:end]
                 chunk_attention = token_mask[start:end]
 
-                # We must wrap them back into batch form for call_embedding_model
-                chunk_ids = chunk_ids.unsqueeze(0)           # (1, chunk_len)
+                # Wrap them into batch form for call_embedding_model
+                chunk_ids = chunk_ids.unsqueeze(0)      # (1, chunk_len)
                 chunk_attention = chunk_attention.unsqueeze(0)
 
                 with torch.no_grad():
-                    # call_embedding_model returns (1, embed_dim) if it’s a pooled embedding
+                    # call_embedding_model => (1, embed_dim)
                     chunk_embedding = model.call_embedding_model(
                         input_ids=chunk_ids,
                         attention_mask=chunk_attention,
                     )
-                    # shape: (1, embed_dim)
-                chunk_embs.append(chunk_embedding.squeeze(0))  # => (embed_dim,)
+                # => shape: (embed_dim,)
+                chunk_embs.append(chunk_embedding.squeeze(0))
 
-                # step forward by chunk_size - overlap
                 step_size = chunk_size - chunk_overlap
                 if step_size <= 0:
                     raise ValueError("chunk_overlap must be smaller than chunk_size.")
                 start += step_size
 
             if len(chunk_embs) == 0:
-                # Handle edge case of empty input
+                # Edge case of empty input
                 chunk_embs = [torch.zeros(model.embedder_dim, device="cpu")]
 
             # Stack => (num_chunks, embed_dim)
             chunk_embs_stacked = torch.stack(chunk_embs, dim=0)
-            # Move to CPU numpy if you want
+
+            # --------- PAD OR TRUNCATE TO (max_num_chunks, embed_dim) -----------
+            num_chunks = chunk_embs_stacked.size(0)
+            if num_chunks < max_num_chunks:
+                # Pad
+                padded_tensor = torch.zeros(
+                    (max_num_chunks, model.embedder_dim),
+                    device=chunk_embs_stacked.device,
+                )
+                padded_tensor[:num_chunks] = chunk_embs_stacked
+                chunk_embs_stacked = padded_tensor
+            elif num_chunks > max_num_chunks:
+                # Truncate
+                chunk_embs_stacked = chunk_embs_stacked[:max_num_chunks]
+
+            # Now shape => (max_num_chunks, embed_dim)
             all_frozen_embs.append(chunk_embs_stacked.cpu().numpy())
 
         else:
-            # Fallback: the old single pooled embedding approach
+            # Fallback: the old single pooled embedding approach (shape => (1, embed_dim))
             with torch.no_grad():
-                # shape => (1, embed_dim)
                 single_emb = model.call_embedding_model(**emb_input)
             # store shape => (embed_dim,)
             all_frozen_embs.append(single_emb.squeeze(0).cpu().numpy())
 
-    # Now we have a list of embeddings, each either shape (embed_dim,) or (num_chunks, embed_dim).
+    # Now we have a list of embeddings.
+    # With chunking: shape => (max_num_chunks, embed_dim) for each example
+    # Without chunking: shape => (embed_dim,) for each example
     batch["frozen_embeddings"] = all_frozen_embs
     return batch
 
