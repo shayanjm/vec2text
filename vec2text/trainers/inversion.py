@@ -57,16 +57,11 @@ class InversionTrainer(BaseTrainer):
         outputs = model(**inputs)
         ce_loss = outputs.loss  # Cross-entropy loss
 
-        cosine_embedding_loss = torch.tensor(0.0, device=ce_loss.device)
-
-        params = list(self.model.parameters()) + list(self.uncertainty_loss.parameters())
-        self.optimizer = torch.optim.AdamW(params, lr=1e-3)
-
-        # Compute embedding loss at specified intervals
         logits = outputs.get("logits")
         pred_ids = torch.argmax(logits, dim=-1).detach().cpu()
         pred_texts = self.tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
 
+        # Get predicted embeddings
         pred_embeddings = []
         for text in pred_texts:
             pred_inputs = self.embedder_tokenizer(
@@ -83,18 +78,32 @@ class InversionTrainer(BaseTrainer):
             pred_embeddings.append(pred_embedding)
 
         pred_embeddings = torch.stack(pred_embeddings)
+
+        # Target embeddings from dataset
         target_embeddings = inputs["frozen_embeddings"]
-        if pred_embeddings.shape != target_embeddings.shape:
-            pred_embeddings = pred_embeddings.view_as(target_embeddings)
-        
+
+        # Check the embedding strategy
+        embedding_strategy = model.config.embedding_transform_strategy
+        if embedding_strategy == "overlap_chunking":
+            # Handle chunked embeddings (target and/or predicted)
+            if target_embeddings.dim() == 3:  # Chunked target embeddings: (batch_size, num_chunks, embed_dim)
+                target_embeddings = target_embeddings.mean(dim=1)  # Mean pooling
+            if pred_embeddings.dim() == 3:  # Chunked predicted embeddings: (batch_size, num_chunks, embed_dim)
+                pred_embeddings = pred_embeddings.mean(dim=1)  # Mean pooling
+        elif embedding_strategy == "repeat":
+            # No chunking; embeddings should already be aligned
+            pass
+        else:
+            raise ValueError(f"Unsupported embedding_transform_strategy: {embedding_strategy}")
+
+        # Assert that shapes are now aligned
+        assert pred_embeddings.shape == target_embeddings.shape, (
+            f"Shape mismatch: pred_embeddings.shape={pred_embeddings.shape}, "
+            f"target_embeddings.shape={target_embeddings.shape}"
+        )
+
+        # Compute cosine similarity loss
         cosine_embedding_loss = 1 - nn.functional.cosine_similarity(pred_embeddings, target_embeddings, dim=-1).mean()
-
-        # Update decaying window means
-        self.ce_batch_count += 1
-        self.ce_running_mean = (self.ce_running_mean * (self.ce_batch_count - 1) + ce_loss.item()) / self.ce_batch_count
-
-        self.cosine_embedding_batch_count += 1
-        self.cosine_embedding_running_mean = (self.cosine_embedding_running_mean * (self.cosine_embedding_batch_count - 1) + cosine_embedding_loss.item()) / self.cosine_embedding_batch_count
 
         # Normalize losses using running means
         normalized_ce_loss = ce_loss / self.ce_running_mean
@@ -116,6 +125,7 @@ class InversionTrainer(BaseTrainer):
         })
 
         return (total_loss, outputs) if return_outputs else total_loss
+
 
     def generate(self, inputs: Dict, generation_kwargs: Dict) -> torch.Tensor:
         return self.model.generate(inputs=inputs, generation_kwargs=generation_kwargs)
