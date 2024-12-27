@@ -72,25 +72,18 @@ class InversionTrainer(BaseTrainer):
         # Compute predicted embeddings
         pred_embeddings = []
         for text in pred_texts:
-            if text in self.embedding_cache:
-                pred_embedding = self.embedding_cache[text].to(ce_loss.device)
-                self.cache_hits += 1
-            else:
-                pred_inputs = self.embedder_tokenizer(
-                    [text],
-                    return_tensors="pt",
-                    padding=True,
-                    truncation=True,
-                    max_length=self.embedder_tokenizer.model_max_length,
-                ).to(ce_loss.device)
-                pred_embedding = self.call_embedding_model(
-                    input_ids=pred_inputs["input_ids"],
-                    attention_mask=pred_inputs["attention_mask"],
-                )
-                self.embedding_cache[text] = pred_embedding.detach().cpu()
-                if len(self.embedding_cache) > self.max_cache_size:
-                    self.embedding_cache.popitem(last=False)
-            pred_embeddings.append(pred_embedding)
+            pred_inputs = self.embedder_tokenizer(
+                [text],
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=self.embedder_tokenizer.model_max_length,
+            ).to(ce_loss.device)
+            pred_embedding = self.call_embedding_model(
+                input_ids=pred_inputs["input_ids"],
+                attention_mask=pred_inputs["attention_mask"],
+            )
+        pred_embeddings.append(pred_embedding)
 
         pred_embeddings = torch.stack(pred_embeddings)
 
@@ -146,7 +139,6 @@ class InversionTrainer(BaseTrainer):
             'normalized_cosine_embedding_loss': normalized_cosine_embedding_loss.detach().item(),
             'total_loss': total_loss.detach().item(),
             **loss_info,  # Includes weighted losses and log-variance parameters
-            'cache_hits': self.cache_hits
         })
 
         return (total_loss, outputs) if return_outputs else total_loss
