@@ -105,6 +105,16 @@ class InversionTrainer(BaseTrainer):
         # Compute cosine similarity loss
         cosine_embedding_loss = 1 - nn.functional.cosine_similarity(pred_embeddings, target_embeddings, dim=-1).mean()
 
+        # Update running means for normalization
+        self.ce_batch_count += 1
+        self.ce_running_mean = (self.ce_running_mean * (self.ce_batch_count - 1) + ce_loss.item()) / self.ce_batch_count
+
+        self.cosine_embedding_batch_count += 1
+        self.cosine_embedding_running_mean = (
+            (self.cosine_embedding_running_mean * (self.cosine_embedding_batch_count - 1) + cosine_embedding_loss.item())
+            / self.cosine_embedding_batch_count
+        )
+
         # Normalize losses using running means
         normalized_ce_loss = ce_loss / self.ce_running_mean
         normalized_cosine_embedding_loss = cosine_embedding_loss / self.cosine_embedding_running_mean
@@ -121,7 +131,7 @@ class InversionTrainer(BaseTrainer):
             'normalized_ce_loss': normalized_ce_loss.detach().item(),
             'normalized_cosine_embedding_loss': normalized_cosine_embedding_loss.detach().item(),
             'total_loss': total_loss.detach().item(),
-            **loss_info,
+            **loss_info,  # Includes learnable log-variances
         })
 
         return (total_loss, outputs) if return_outputs else total_loss
