@@ -83,7 +83,7 @@ class InversionTrainer(BaseTrainer):
         target_embeddings = inputs["frozen_embeddings"]
 
         # Check the embedding strategy
-        embedding_strategy = model.config.embedding_transform_strategy
+        embedding_strategy = self.model.config.embedding_transform_strategy
         if embedding_strategy == "overlap_chunking":
             # Handle chunked embeddings (target and/or predicted)
             if target_embeddings.dim() == 3:  # Chunked target embeddings: (batch_size, num_chunks, embed_dim)
