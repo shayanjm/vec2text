@@ -310,7 +310,7 @@ class InversionModel(transformers.PreTrainedModel):
             alpha=alpha,
             beta=beta,
             length_penalty=length_penalty,
-        )
+        )   
 
     def _single_pass_generate(
         self, 
@@ -318,7 +318,7 @@ class InversionModel(transformers.PreTrainedModel):
         generation_kwargs: Dict[str, torch.Tensor]
     ) -> torch.Tensor:
         """
-        Your old single-pass approach: embed_and_project -> encoder_decoder.generate(...)
+        Old single-pass approach: embed_and_project -> encoder_decoder.generate(...)
         """
         # embed & project
         inputs_embeds, attention_mask = self.embed_and_project(
