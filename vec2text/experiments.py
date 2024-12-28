@@ -418,9 +418,6 @@ class Experiment(abc.ABC):
             print(
                 f"[Precomputing embeddings with batch size: {self.training_args.per_device_train_batch_size}]"
             )
-            print(
-                f"[Using transform strategy {self.model_args.embedding_transform_strategy}]"
-            )
             assert torch.cuda.is_available()
             model = model.to(device)
 
@@ -557,13 +554,8 @@ class Experiment(abc.ABC):
         ######################################################################
         train_dataset_kwargs = {
             "dataset_name": self.data_args.dataset_name,
-            "embedding_transform_strategy": self.model_args.embedding_transform_strategy,
             **dataset_kwargs,
         }
-        if self.model_args.embedding_transform_strategy == "overlap_chunking":
-            train_dataset_kwargs["chunk_size"] = self.model_args.chunk_size
-            train_dataset_kwargs["chunk_overlap"] = self.model_args.chunk_overlap
-
         train_dataset_path = os.path.join(
             DATASET_CACHE_PATH, (md5_hash_kwargs(**train_dataset_kwargs) + ".arrow")
         )
