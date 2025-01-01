@@ -283,6 +283,22 @@ class InversionModel(transformers.PreTrainedModel):
             alpha, beta: weighting for LM log-prob vs. embedding similarity
             length_penalty: penalize longer sequences in scoring
         """
+        # Pull out any custom arguments from generation_kwargs if present
+        if "guided" in generation_kwargs:
+            guided = generation_kwargs.pop("guided")
+        if "checkpoint_interval" in generation_kwargs:
+            checkpoint_interval = generation_kwargs.pop("checkpoint_interval")
+        if "beam_size" in generation_kwargs:
+            beam_size = generation_kwargs.pop("beam_size")
+        if "multipass" in generation_kwargs:
+            multipass = generation_kwargs.pop("multipass")
+        if "alpha" in generation_kwargs:
+            alpha = generation_kwargs.pop("alpha")
+        if "beta" in generation_kwargs:
+            beta = generation_kwargs.pop("beta")
+        if "length_penalty" in generation_kwargs:
+            length_penalty = generation_kwargs.pop("length_penalty")
+
         # 1) If guided=False and multipass=1 => do your existing single pass
         if not guided and multipass == 1:
             return self._single_pass_generate(inputs=inputs, generation_kwargs=generation_kwargs)
