@@ -4,6 +4,7 @@ from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import transformers
 from sentence_transformers import SentenceTransformer
 
@@ -360,47 +361,49 @@ class InversionModel(transformers.PreTrainedModel):
     ) -> torch.Tensor:
         """
         A single decoding pass with partial-chunk/beam-checkpoint logic:
-          1) Expand partials, 
-          2) every `checkpoint_interval` tokens, embed partials, combine similarity with LM log-prob, prune beam
-          3) continue until max_new_tokens or EOS
-        We'll produce the best final output (token IDs).
+        1) Expand partials with LM
+        2) every `checkpoint_interval` tokens, embed partials, compare with target embedding, 
+            combine similarity with LM log-prob, and prune the beam
+        3) continue until max_new_tokens or EOS
+        4) Return best final output IDs
         """
+
         device = self.device
-        # We need to embed_and_project to get the "inputs_embeds" for the T5 encoder
-        # but we're going to manually do the decoding side ourselves, in a custom loop
-        # if we're fully overriding the beam. Alternatively, we can do partial chunk logic by 
-        # hooking into each token step. This code is a high-level sample.
 
-        # Let's do a simpler approach: we'll replicate the method from 
-        # "guided beam search" snippet. 
-        # For brevity, see that snippet for details. We'll just show a short version:
-
+        # 1) We do the embedding->project exactly ONCE to get inputs_embeds for T5
+        #    This is the "frozen" or "original" embedding that T5's encoder will see.
         inputs_embeds, attention_mask = self.embed_and_project(
             embedder_input_ids=inputs.get("embedder_input_ids"),
             embedder_attention_mask=inputs.get("embedder_attention_mask"),
             frozen_embeddings=inputs.get("frozen_embeddings"),
         )
 
-        # Assume batch_size=1 for simplicity
+        # 2) We create an initial beam with a single hypothesis
         start_token_id = self.tokenizer.pad_token_id
-        eos_token_id   = self.tokenizer.eos_token_id
+        eos_token_id = self.tokenizer.eos_token_id
         beam = [{
             "tokens": [start_token_id],
             "lm_log_prob": 0.0,
         }]
         finished = []
 
+        # We'll read HF generation kwargs for typical parameters (e.g. max_new_tokens)
         max_new_tokens = generation_kwargs.get("max_new_tokens", 50)
 
         for step in range(max_new_tokens):
             new_candidates = []
+
+            # Expand each hypothesis by 1 token
             for hyp in beam:
                 if hyp["tokens"][-1] == eos_token_id:
+                    # Already ended, just carry it forward
                     new_candidates.append(hyp)
                     continue
 
-                # build decoder_input_ids
+                # Build decoder_input_ids for T5
                 decoder_input_ids = torch.tensor([hyp["tokens"]], device=device)
+
+                # -- Evaluate next-token logits from T5
                 with torch.no_grad():
                     out = self.encoder_decoder(
                         inputs_embeds=inputs_embeds,
@@ -409,50 +412,57 @@ class InversionModel(transformers.PreTrainedModel):
                     )
                 next_logits = out.logits[0, -1, :]
                 next_probs = torch.softmax(next_logits, dim=-1)
+
+                # -- Expand top K beams
                 topk = torch.topk(next_probs, beam_size)
                 for tk_id, tk_prob in zip(topk.indices.tolist(), topk.values.tolist()):
                     new_seq = hyp["tokens"] + [tk_id]
-                    new_lp  = hyp["lm_log_prob"] + math.log(tk_prob + 1e-9)
+                    new_lp = hyp["lm_log_prob"] + math.log(tk_prob + 1e-9)
                     new_candidates.append({
                         "tokens": new_seq,
                         "lm_log_prob": new_lp,
                     })
 
-            # prune quickly by LM log-prob
+            # 3) Quick beam pruning by LM log-prob
             new_candidates.sort(key=lambda c: c["lm_log_prob"], reverse=True)
             new_candidates = new_candidates[: beam_size * 2]
 
-            # checkpoint?
+            # 4) If it's a checkpoint interval, do partial re-embed and combine with LM log-prob
+            #    so that the beam is partially guided by the embedding similarity.
             is_checkpoint = ((step + 1) % checkpoint_interval == 0) or (step == max_new_tokens - 1)
+
             if is_checkpoint:
-                # embed partial sequences, combine with lm_log_prob
                 scored = []
                 for cand in new_candidates:
                     if cand["tokens"][-1] == eos_token_id:
                         # no partial embed
-                        cand["combined_score"] = cand["lm_log_prob"]  
+                        cand["combined_score"] = cand["lm_log_prob"]
                         scored.append(cand)
                     else:
-                        # decode to text
+                        # decode partial text
                         txt = self.tokenizer.decode(cand["tokens"], skip_special_tokens=True)
+                        # re-embed just for scoring => shape (1, embed_dim)
                         emb_inp = self.embedder_tokenizer(txt, return_tensors="pt").to(device)
                         with torch.no_grad():
                             partial_emb = self.call_embedding_model(
                                 input_ids=emb_inp["input_ids"],
                                 attention_mask=emb_inp["attention_mask"],
                             )
-                        # compare partial_emb to target, e.g. if "frozen_embeddings" was your target
-                        # if you have a known "target_embedding" from the inputs, e.g. inputs["target_embedding"]
-                        # do cos_sim = ...
-                        target_emb = inputs.get("target_embedding", None)
+                        # partial_emb is (1, embed_dim). The "target" embedding is also (embed_dim) or (1, embed_dim).
+
+                        # Compare partial_emb to target
+                        target_emb = inputs.get("target_embedding", None)  # shape (embed_dim,)
                         if target_emb is not None:
-                            cos_sim = torch.nn.functional.cosine_similarity(
-                                partial_emb, target_emb.unsqueeze(0), dim=-1
+                            cos_sim = F.cosine_similarity(
+                                partial_emb, 
+                                target_emb.unsqueeze(0),  # shape (1, embed_dim)
+                                dim=-1
                             )
                             cand["embed_score"] = cos_sim.item()
                         else:
                             cand["embed_score"] = 0.0
-                        # combine
+
+                        # combine LM log-prob with embedding similarity
                         seq_len = len(cand["tokens"])
                         lp = (5 + seq_len) / 6.0
                         cand["combined_score"] = (
@@ -461,8 +471,10 @@ class InversionModel(transformers.PreTrainedModel):
                         )
                         scored.append(cand)
 
+                # Re-sort by combined_score
                 scored.sort(key=lambda c: c["combined_score"], reverse=True)
                 scored = scored[: beam_size]
+
                 # separate out ended
                 beam = []
                 for s in scored:
@@ -471,7 +483,7 @@ class InversionModel(transformers.PreTrainedModel):
                     else:
                         beam.append(s)
             else:
-                # no checkpoint => keep top beam_size by LM log prob
+                # Not a checkpoint: keep top beam_size by LM log-prob
                 new_candidates = new_candidates[: beam_size]
                 next_beam = []
                 for c in new_candidates:
@@ -485,12 +497,13 @@ class InversionModel(transformers.PreTrainedModel):
                 break
 
         finished.extend(beam)
-        # pick best final by combined_score or lm_log_prob if it never got a checkpoint
+        # pick best final by combined_score if available, else fall back to lm_log_prob
         for f in finished:
             if "combined_score" not in f:
                 seq_len = len(f["tokens"])
                 lp = (5 + seq_len) / 6.0
                 f["combined_score"] = f["lm_log_prob"] / (lp ** length_penalty)
+
         finished.sort(key=lambda c: c["combined_score"], reverse=True)
         best = finished[0]["tokens"]
         return torch.tensor([best], device=device, dtype=torch.long)
@@ -506,13 +519,10 @@ class InversionModel(transformers.PreTrainedModel):
         beta: float,
         length_penalty: float,
     ) -> torch.Tensor:
-        """
-        Repeatedly do guided beam search, re-embed the best final output each time,
-        feed that embedding back in as the new input for next pass.
-        """
+
         device = self.device
 
-        # 1) Pass #1
+        # 1) First pass
         best_output_ids = self._guided_beam_search_single_pass(
             inputs=inputs,
             generation_kwargs=generation_kwargs,
@@ -523,14 +533,15 @@ class InversionModel(transformers.PreTrainedModel):
             length_penalty=length_penalty,
         )
 
-        # 2) If we only had 1 pass, we're done
         if num_passes <= 1:
             return best_output_ids
 
-        # 3) For additional passes, re-embed best output each time
+        # 2) For each additional pass, re-embed best final output & feed as "frozen_embeddings"
         for pass_idx in range(1, num_passes):
-            # decode best output => text
+            # decode tokens => text
             txts = self.tokenizer.batch_decode(best_output_ids, skip_special_tokens=True)
+
+            # re-embed final best text => shape (batch, embed_dim)
             new_embs = []
             for t in txts:
                 emb_inp = self.embedder_tokenizer(t, return_tensors="pt").to(device)
@@ -540,13 +551,13 @@ class InversionModel(transformers.PreTrainedModel):
                         attention_mask=emb_inp["attention_mask"]
                     )
                 new_embs.append(e)
-            new_embs = torch.cat(new_embs, dim=0) # shape (batch, embed_dim)
+            new_embs = torch.cat(new_embs, dim=0)  # (batch, embed_dim)
 
-            # feed that in as frozen_embeddings to next pass
-            new_inputs = copy.copy(inputs)
+            # feed that in as "frozen_embeddings" for the next pass
+            new_inputs = dict(inputs)
             new_inputs["frozen_embeddings"] = new_embs
 
-            # re-generate with partial-chunk beam search
+            # 3) guided beam search again
             best_output_ids = self._guided_beam_search_single_pass(
                 inputs=new_inputs,
                 generation_kwargs=generation_kwargs,

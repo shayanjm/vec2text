@@ -17,6 +17,8 @@ torch.cuda.set_device(local_rank)
 # Load experiment and trainer
 experiment, trainer = load_experiment_and_trainer('./output')
 
+trainer.enable_emb_cos_sim_metric()
+
 # Initialize Accelerator and associate it with the trainer
 accelerator = Accelerator()
 trainer.accelerator = accelerator
