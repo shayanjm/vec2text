@@ -17,8 +17,6 @@ torch.cuda.set_device(local_rank)
 # Load experiment and trainer
 experiment, trainer = load_experiment_and_trainer('./output')
 
-trainer.enable_emb_cos_sim_metric()
-
 # Initialize Accelerator and associate it with the trainer
 accelerator = Accelerator()
 trainer.accelerator = accelerator
@@ -31,6 +29,25 @@ if dist.is_initialized():
 try:
     print(f"[Rank {local_rank}] Starting evaluation...")
 
+    ############################################
+    # 3) Guided Decoding (Single Pass)
+    ############################################
+    print(f"\n[Rank {local_rank}] === 3) Guided Decoding (Single Pass) ===")
+    trainer.gen_kwargs["guided"] = True
+    trainer.gen_kwargs["checkpoint_interval"] = 10
+    trainer.gen_kwargs["beam_size"] = 5
+    trainer.gen_kwargs["multipass"] = 1
+    trainer.gen_kwargs["alpha"] = 0.5
+    trainer.gen_kwargs["beta"] = 1.5
+    trainer.gen_kwargs["length_penalty"] = 1.0
+
+    # Typically set HF generation to beam-style:
+    trainer.gen_kwargs["do_sample"] = False
+    trainer.gen_kwargs["num_beams"] = 5
+    trainer.gen_kwargs["max_new_tokens"] = 64
+
+    metrics = trainer.evaluate()
+    print("[Guided Decoding (Single Pass) metrics]", metrics)
     ############################################
     # BASELINE
     ############################################
@@ -85,26 +102,6 @@ try:
 
     metrics = trainer.evaluate()
     print("[Single-Pass, Top-k Sampling metrics]", metrics)
-
-    ############################################
-    # 3) Guided Decoding (Single Pass)
-    ############################################
-    print(f"\n[Rank {local_rank}] === 3) Guided Decoding (Single Pass) ===")
-    trainer.gen_kwargs["guided"] = True
-    trainer.gen_kwargs["checkpoint_interval"] = 10
-    trainer.gen_kwargs["beam_size"] = 5
-    trainer.gen_kwargs["multipass"] = 1
-    trainer.gen_kwargs["alpha"] = 0.5
-    trainer.gen_kwargs["beta"] = 1.5
-    trainer.gen_kwargs["length_penalty"] = 1.0
-
-    # Typically set HF generation to beam-style:
-    trainer.gen_kwargs["do_sample"] = False
-    trainer.gen_kwargs["num_beams"] = 5
-    trainer.gen_kwargs["max_new_tokens"] = 64
-
-    metrics = trainer.evaluate()
-    print("[Guided Decoding (Single Pass) metrics]", metrics)
 
     ############################################
     # 4) Guided Decoding + Higher Checkpoint Frequency
