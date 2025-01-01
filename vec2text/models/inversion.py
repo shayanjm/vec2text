@@ -361,12 +361,19 @@ class InversionModel(transformers.PreTrainedModel):
     ) -> torch.Tensor:
         """
         A single decoding pass with partial-chunk/beam-checkpoint logic,
-        but done with one forward pass per step across all beams.
+        now generalized to arbitrary batch_size B.
+
+        We'll maintain B groups of beam_size hypotheses each, for a total
+        of (B * beam_size) partial sequences in parallel.
         """
+
+        import math
+        import torch
+        import torch.nn.functional as F
 
         device = self.device
 
-        # 1) We do the embedding->project exactly ONCE to get inputs_embeds for T5
+        # 1) Encode once to get inputs_embeds for T5 of shape: [B, enc_seq_len, hidden_dim].
         inputs_embeds, attention_mask = self.embed_and_project(
             embedder_input_ids=inputs.get("embedder_input_ids"),
             embedder_attention_mask=inputs.get("embedder_attention_mask"),
@@ -374,161 +381,221 @@ class InversionModel(transformers.PreTrainedModel):
         )
         batch_size = inputs_embeds.size(0)
 
-        # For simplicity, either require batch_size=1 or replicate for all items.
-        if batch_size != 1:
-            raise NotImplementedError(
-                f"This guided beam search code only handles batch_size=1 for now, but got {batch_size}."
-            )
+        # 2) Repeat (tile) the encoder inputs across beam_size => [B*beam_size, enc_seq_len, hidden_dim].
+        #    Also repeat the attention_mask => [B*beam_size, enc_seq_len].
+        inputs_embeds = inputs_embeds.unsqueeze(1).repeat(1, beam_size, 1, 1)  # [B, beam_size, enc_seq_len, hidden_dim]
+        inputs_embeds = inputs_embeds.view(batch_size * beam_size, *inputs_embeds.shape[2:])
 
-        # 2) Expand the encoder inputs across the beam dimension => shape [beam_size, seq_len, hidden_dim]
-        inputs_embeds = inputs_embeds.repeat(beam_size, 1, 1)
-        attention_mask = attention_mask.repeat(beam_size, 1)
+        attention_mask = attention_mask.unsqueeze(1).repeat(1, beam_size, 1)  # [B, beam_size, enc_seq_len]
+        attention_mask = attention_mask.view(batch_size * beam_size, -1)
+
+        # 3) Prepare the initial beam states:
+        #    We'll have a total of B*beam_size "rows" in the batch dimension,
+        #    each one storing partial tokens, log-prob, etc.
+        #    We'll store them in a list "beam_hyps" of length (B * beam_size).
+        #    Each entry: {
+        #        "batch_idx": i,  # which *original* example in [0..B-1]
+        #        "tokens": [...],
+        #        "lm_log_prob": 0.0,
+        #    }
+        start_token_id = self.tokenizer.pad_token_id
+        eos_token_id = self.tokenizer.eos_token_id
+        beam_hyps = []
+        for batch_i in range(batch_size):
+            for beam_j in range(beam_size):
+                beam_hyps.append({
+                    "batch_idx": batch_i,     # which original example?
+                    "tokens": [start_token_id],
+                    "lm_log_prob": 0.0,
+                    # "combined_score" is set only at checkpoint
+                })
+
+        finished = [[] for _ in range(batch_size)]  # store finished hyps per example
 
         # We'll read HF generation kwargs for typical parameters (e.g. max_new_tokens)
         max_new_tokens = generation_kwargs.get("max_new_tokens", 50)
 
-        # Start with a beam of size = beam_size, each item is a dict
-        # We store 'tokens' = list of token_ids, plus 'lm_log_prob'
-        # We'll treat each beam row in the batch dimension as one partial sequence
-        start_token_id = self.tokenizer.pad_token_id
-        eos_token_id = self.tokenizer.eos_token_id
-        beam_hyps = []
-        for b in range(beam_size):
-            beam_hyps.append({
-                "tokens": [start_token_id],
-                "lm_log_prob": 0.0,
-                # We will fill combined_score during checkpoint
-            })
+        # If we have "target_embedding" => shape [B, emb_dim]
+        # We'll use it to compare partial text embeddings during checkpoints
+        batch_target_emb = inputs.get("target_embedding", None)  # Optional[Tensor], shape [B, emb_dim]
 
-        finished = []
-
-        # Main decoding loop
+        # 4) Main decoding loop
         for step in range(max_new_tokens):
-            # (a) Build decoder_input_ids for all beams => shape [beam_size, seq_len_so_far]
-            decoder_input_ids_list = []
+            # (a) Build decoder_input_ids => shape [B*beam_size, dec_seq_len_so_far].
+            #     We gather the partial 'tokens' from each of the B*beam_size beam items.
             max_len = max(len(hyp["tokens"]) for hyp in beam_hyps)
+            decoder_input_ids_list = []
             for hyp in beam_hyps:
-                # pad each beam's partial tokens to max_len
                 needed = max_len - len(hyp["tokens"])
-                beam_tokens = hyp["tokens"] + [self.tokenizer.pad_token_id] * needed
-                decoder_input_ids_list.append(beam_tokens)
-
+                padded_tokens = hyp["tokens"] + [start_token_id] * needed
+                decoder_input_ids_list.append(padded_tokens)
             decoder_input_ids = torch.tensor(decoder_input_ids_list, device=device)
 
-            # (b) Single forward pass
+            # (b) Forward pass (one big batch of size B*beam_size)
             with torch.no_grad():
                 out = self.encoder_decoder(
-                    inputs_embeds=inputs_embeds,      # shape [beam_size, enc_seq_len, hidden_dim]
-                    attention_mask=attention_mask,     # shape [beam_size, enc_seq_len]
-                    decoder_input_ids=decoder_input_ids  # shape [beam_size, dec_seq_len]
+                    inputs_embeds=inputs_embeds,        # [B*beam_size, enc_seq_len, hidden_dim]
+                    attention_mask=attention_mask,       # [B*beam_size, enc_seq_len]
+                    decoder_input_ids=decoder_input_ids, # [B*beam_size, dec_seq_len_so_far]
                 )
-            # next_logits => [beam_size, dec_seq_len, vocab_size]
-            next_logits = out.logits[:, -1, :]  # shape [beam_size, vocab_size]
+            # out.logits => shape [B*beam_size, dec_seq_len_so_far, vocab_size]
+            next_logits = out.logits[:, -1, :]  # => [B*beam_size, vocab_size]
 
-            # (c) Expand each of the beam_size hypotheses by top-k next tokens
-            new_candidates = []
-            for b_idx, hyp in enumerate(beam_hyps):
+            # (c) We'll expand each example's beams separately, so we don't mix beam expansions across examples.
+            #     We'll group the B*beam_size rows by example => "grouped" by batch_idx in [0..B-1].
+            #     Then for each group => we do topk expansions. We'll accumulate expansions into next_beam_hyps_list.
+            next_beam_hyps_list = [[] for _ in range(batch_size)]
+
+            for row_idx, hyp in enumerate(beam_hyps):
+                batch_i = hyp["batch_idx"]
+                # If already ended => carry forward
                 if hyp["tokens"][-1] == eos_token_id:
-                    # Already ended => keep as-is (don't expand)
-                    new_candidates.append(hyp)
+                    next_beam_hyps_list[batch_i].append(hyp)
                     continue
 
-                probs = torch.softmax(next_logits[b_idx], dim=-1)
-                topk = torch.topk(probs, beam_size)
+                # Expand by top-k
+                row_probs = torch.softmax(next_logits[row_idx], dim=-1)
+                topk = torch.topk(row_probs, beam_size)
                 for tk_id, tk_prob in zip(topk.indices.tolist(), topk.values.tolist()):
                     new_seq = hyp["tokens"] + [tk_id]
                     new_lp = hyp["lm_log_prob"] + math.log(tk_prob + 1e-9)
-                    new_candidates.append({
+                    next_beam_hyps_list[batch_i].append({
+                        "batch_idx": batch_i,
                         "tokens": new_seq,
                         "lm_log_prob": new_lp,
                     })
 
-            # (d) Quick beam pruning by LM log-prob => keep top (beam_size * 2) 
-            new_candidates.sort(key=lambda c: c["lm_log_prob"], reverse=True)
-            new_candidates = new_candidates[: beam_size * 2]
+            # (d) Now for each example's group, we do "quick beam pruning" by LM log-prob => keep top (beam_size * 2)
+            #     so we don't blow up in size. We'll store them back in the same next_beam_hyps_list[batch_i].
+            for batch_i in range(batch_size):
+                group_cands = next_beam_hyps_list[batch_i]
+                group_cands.sort(key=lambda c: c["lm_log_prob"], reverse=True)
+                group_cands = group_cands[: beam_size * 2]
+                next_beam_hyps_list[batch_i] = group_cands
 
-            # (e) If it's a checkpoint step, re-embed each partial text to get 'embed_score'
+            # (e) If it's a checkpoint step, re-embed partial text for each group candidate.
+            #     Then combine LM log-prob w/ embedding similarity => "combined_score".
             is_checkpoint = ((step + 1) % checkpoint_interval == 0) or (step == max_new_tokens - 1)
+
             if is_checkpoint:
-                scored = []
-                for cand in new_candidates:
-                    # If ended, skip partial embed
-                    if cand["tokens"][-1] == eos_token_id:
-                        cand["combined_score"] = cand["lm_log_prob"]
-                        scored.append(cand)
-                        continue
+                # We'll produce the new pruned list for each example after embed-based scoring.
+                new_beam_hyps_list = [[] for _ in range(batch_size)]
+                for batch_i in range(batch_size):
+                    scored = []
+                    for cand in next_beam_hyps_list[batch_i]:
+                        # If ended => no partial embed
+                        if cand["tokens"][-1] == eos_token_id:
+                            cand["combined_score"] = cand["lm_log_prob"]
+                            scored.append(cand)
+                        else:
+                            # decode partial text
+                            txt = self.tokenizer.decode(cand["tokens"], skip_special_tokens=True)
+                            # re-embed partial text => shape [1, embed_dim]
+                            emb_inp = self.embedder_tokenizer(txt, return_tensors="pt").to(device)
+                            with torch.no_grad():
+                                partial_emb = self.call_embedding_model(
+                                    input_ids=emb_inp["input_ids"],
+                                    attention_mask=emb_inp["attention_mask"],
+                                )
+                            # If we have a batch target embedding => get the row = target_emb[batch_i]
+                            embed_score = 0.0
+                            if batch_target_emb is not None:
+                                # shape => [embed_dim]
+                                example_target = batch_target_emb[batch_i]
+                                cos_sim = F.cosine_similarity(partial_emb, example_target.unsqueeze(0), dim=-1)
+                                embed_score = cos_sim.item()
 
-                    # Convert partial tokens -> text
-                    txt = self.tokenizer.decode(cand["tokens"], skip_special_tokens=True)
+                            seq_len = len(cand["tokens"])
+                            lp = (5 + seq_len) / 6.0
+                            cand["embed_score"] = embed_score
+                            cand["combined_score"] = (
+                                alpha * (cand["lm_log_prob"] / (lp ** length_penalty))
+                                + beta * embed_score
+                            )
+                            scored.append(cand)
 
-                    # Re-embed partial text => shape (1, embed_dim)
-                    emb_inp = self.embedder_tokenizer(txt, return_tensors="pt").to(device)
-                    with torch.no_grad():
-                        partial_emb = self.call_embedding_model(
-                            input_ids=emb_inp["input_ids"],
-                            attention_mask=emb_inp["attention_mask"],
-                        )
+                    # re-sort by combined_score => keep top beam_size
+                    scored.sort(key=lambda c: c["combined_score"], reverse=True)
+                    scored = scored[: beam_size]
 
-                    # Compare partial_emb to target (if provided)
-                    target_emb = inputs.get("target_embedding", None)
-                    if target_emb is not None:
-                        cos_sim = F.cosine_similarity(
-                            partial_emb, 
-                            target_emb.unsqueeze(0),  # shape [1, embed_dim]
-                            dim=-1
-                        )
-                        cand["embed_score"] = cos_sim.item()
-                    else:
-                        cand["embed_score"] = 0.0
+                    # separate out ended
+                    still_going = []
+                    for s in scored:
+                        if s["tokens"][-1] == eos_token_id:
+                            finished[batch_i].append(s)
+                        else:
+                            still_going.append(s)
+                    new_beam_hyps_list[batch_i] = still_going
 
-                    # Combine LM log-prob + embed_score
-                    seq_len = len(cand["tokens"])
-                    lp = (5 + seq_len) / 6.0
-                    cand["combined_score"] = (
-                        alpha * (cand["lm_log_prob"] / (lp ** length_penalty))
-                        + beta * cand["embed_score"]
-                    )
-                    scored.append(cand)
-
-                # Re-sort by combined_score, keep top beam_size
-                scored.sort(key=lambda c: c["combined_score"], reverse=True)
-                scored = scored[: beam_size]
-
-                # Split out ended vs. still going
-                beam_hyps = []
-                for s in scored:
-                    if s["tokens"][-1] == eos_token_id:
-                        finished.append(s)
-                    else:
-                        beam_hyps.append(s)
+                # Overwrite next_beam_hyps_list with new_beam_hyps_list
+                next_beam_hyps_list = new_beam_hyps_list
             else:
-                # Not a checkpoint => keep top beam_size by LM log-prob
-                new_candidates = new_candidates[: beam_size]
-                next_beam = []
-                for c in new_candidates:
-                    if c["tokens"][-1] == eos_token_id:
-                        finished.append(c)
-                    else:
-                        next_beam.append(c)
-                beam_hyps = next_beam
+                # Not a checkpoint => keep top beam_size by LM log-prob, then remove ended from beam
+                new_beam_hyps_list = [[] for _ in range(batch_size)]
+                for batch_i in range(batch_size):
+                    group_cands = next_beam_hyps_list[batch_i][: beam_size]
+                    still_going = []
+                    for c in group_cands:
+                        if c["tokens"][-1] == eos_token_id:
+                            finished[batch_i].append(c)
+                        else:
+                            still_going.append(c)
+                    new_beam_hyps_list[batch_i] = still_going
+                next_beam_hyps_list = new_beam_hyps_list
 
-            if not beam_hyps:
+            # If all groups are empty => done
+            all_empty = True
+            for batch_i in range(batch_size):
+                if len(next_beam_hyps_list[batch_i]) > 0:
+                    all_empty = False
+                    break
+            if all_empty:
+                # All beams ended
                 break
 
-        # (f) Add leftover beams to finished
-        finished.extend(beam_hyps)
+            # Flatten next_beam_hyps_list => beam_hyps again for next iteration
+            beam_hyps = []
+            for batch_i in range(batch_size):
+                beam_hyps.extend(next_beam_hyps_list[batch_i])
 
-        # Pick best final by combined_score if available, else fallback to lm_log_prob
-        for f in finished:
-            if "combined_score" not in f:
-                seq_len = len(f["tokens"])
-                lp = (5 + seq_len) / 6.0
-                f["combined_score"] = f["lm_log_prob"] / (lp ** length_penalty)
+        # 5) End of the main loop: collect leftover beams that haven't ended
+        for cand in beam_hyps:
+            batch_i = cand["batch_idx"]
+            finished[batch_i].append(cand)
 
-        finished.sort(key=lambda c: c["combined_score"], reverse=True)
-        best = finished[0]["tokens"]
+        # 6) For each example in the batch, pick the best final candidate by "combined_score" if available,
+        #    else fallback to "lm_log_prob".
+        outputs = []
+        for batch_i in range(batch_size):
+            # if somehow no finished => don't panic, just use whatever is in 'finished' 
+            if not finished[batch_i]:
+                # This means we have no ended or leftover => fallback
+                outputs.append(torch.tensor([start_token_id], device=device))
+                continue
 
-        return torch.tensor([best], device=device, dtype=torch.long)
+            for f in finished[batch_i]:
+                if "combined_score" not in f:
+                    seq_len = len(f["tokens"])
+                    lp = (5 + seq_len) / 6.0
+                    f["combined_score"] = f["lm_log_prob"] / (lp ** length_penalty)
+
+            # pick best final
+            finished[batch_i].sort(key=lambda c: c["combined_score"], reverse=True)
+            best = finished[batch_i][0]["tokens"]
+            outputs.append(torch.tensor(best, device=device))
+
+        # 7) Pad all outputs in this batch to same length & return a single tensor
+        max_len = max(len(seq) for seq in outputs)
+        padded = []
+        for seq in outputs:
+            needed = max_len - seq.size(0)
+            if needed > 0:
+                seq = torch.cat([seq, seq.new_full((needed,), self.tokenizer.pad_token_id)])
+            padded.append(seq.unsqueeze(0))
+        # shape => [B, max_len]
+        final_outputs = torch.cat(padded, dim=0)
+
+        return final_outputs
 
     def _multipass_guided_decode(
         self,
