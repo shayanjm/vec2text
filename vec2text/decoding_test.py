@@ -90,7 +90,7 @@ try:
     print(f"\n[Rank {local_rank}] === 3) Guided Decoding (Single Pass) ===")
     trainer.gen_kwargs["guided"] = True
     trainer.gen_kwargs["checkpoint_interval"] = 10
-    trainer.gen_kwargs["beam_size"] = 3
+    trainer.gen_kwargs["beam_size"] = 4
     trainer.gen_kwargs["multipass"] = 1
     trainer.gen_kwargs["alpha"] = 0.5
     trainer.gen_kwargs["beta"] = 1.5
@@ -98,7 +98,7 @@ try:
 
     # Typically set HF generation to beam-style:
     trainer.gen_kwargs["do_sample"] = False
-    trainer.gen_kwargs["num_beams"] = 3
+    trainer.gen_kwargs["num_beams"] = 4
     trainer.gen_kwargs["max_new_tokens"] = 64
 
     metrics = trainer.evaluate()
@@ -110,14 +110,14 @@ try:
     print(f"\n[Rank {local_rank}] === 4) Guided Decoding, freq=5 ===")
     trainer.gen_kwargs["guided"] = True
     trainer.gen_kwargs["checkpoint_interval"] = 5
-    trainer.gen_kwargs["beam_size"] = 3
+    trainer.gen_kwargs["beam_size"] = 4
     trainer.gen_kwargs["multipass"] = 1
     trainer.gen_kwargs["alpha"] = 1.0
     trainer.gen_kwargs["beta"] = 1.0
     trainer.gen_kwargs["length_penalty"] = 1.0
 
     trainer.gen_kwargs["do_sample"] = False
-    trainer.gen_kwargs["num_beams"] = 3
+    trainer.gen_kwargs["num_beams"] = 4
     trainer.gen_kwargs["max_new_tokens"] = 64
 
     metrics = trainer.evaluate()
@@ -129,14 +129,14 @@ try:
     print(f"\n[Rank {local_rank}] === 5) Multipass Iterative Refinement ===")
     trainer.gen_kwargs["guided"] = True
     trainer.gen_kwargs["checkpoint_interval"] = 10
-    trainer.gen_kwargs["beam_size"] = 3
+    trainer.gen_kwargs["beam_size"] = 4
     trainer.gen_kwargs["multipass"] = 2   # or 3
     trainer.gen_kwargs["alpha"] = 1.0
     trainer.gen_kwargs["beta"] = 1.0
     trainer.gen_kwargs["length_penalty"] = 1.2
 
     trainer.gen_kwargs["do_sample"] = False
-    trainer.gen_kwargs["num_beams"] = 3
+    trainer.gen_kwargs["num_beams"] = 4
     trainer.gen_kwargs["max_new_tokens"] = 64
 
     metrics = trainer.evaluate()
@@ -148,14 +148,14 @@ try:
     print(f"\n[Rank {local_rank}] === 6) Multipass w/ Strong Embedding Guidance ===")
     trainer.gen_kwargs["guided"] = True
     trainer.gen_kwargs["checkpoint_interval"] = 10
-    trainer.gen_kwargs["beam_size"] = 3
+    trainer.gen_kwargs["beam_size"] = 4
     trainer.gen_kwargs["multipass"] = 2
     trainer.gen_kwargs["alpha"] = 0.7
     trainer.gen_kwargs["beta"] = 2.0
     trainer.gen_kwargs["length_penalty"] = 1.0
 
     trainer.gen_kwargs["do_sample"] = False
-    trainer.gen_kwargs["num_beams"] = 3
+    trainer.gen_kwargs["num_beams"] = 4
     trainer.gen_kwargs["max_new_tokens"] = 64
 
     metrics = trainer.evaluate()
@@ -167,14 +167,14 @@ try:
     print(f"\n[Rank {local_rank}] === 7) Short Checkpoints & Multipass ===")
     trainer.gen_kwargs["guided"] = True
     trainer.gen_kwargs["checkpoint_interval"] = 5
-    trainer.gen_kwargs["beam_size"] = 3
+    trainer.gen_kwargs["beam_size"] = 4
     trainer.gen_kwargs["multipass"] = 2
     trainer.gen_kwargs["alpha"] = 1.0
     trainer.gen_kwargs["beta"] = 1.5
     trainer.gen_kwargs["length_penalty"] = 1.0
 
     trainer.gen_kwargs["do_sample"] = False
-    trainer.gen_kwargs["num_beams"] = 3
+    trainer.gen_kwargs["num_beams"] = 4
     trainer.gen_kwargs["max_new_tokens"] = 64
 
     metrics = trainer.evaluate()
@@ -186,7 +186,7 @@ try:
     print(f"\n[Rank {local_rank}] === 8) Looser Generation + Guidance ===")
     trainer.gen_kwargs["guided"] = True
     trainer.gen_kwargs["checkpoint_interval"] = 10
-    trainer.gen_kwargs["beam_size"] = 3
+    trainer.gen_kwargs["beam_size"] = 4
     trainer.gen_kwargs["multipass"] = 1  # or 2
     trainer.gen_kwargs["alpha"] = 1.0
     trainer.gen_kwargs["beta"] = 1.0
@@ -195,7 +195,7 @@ try:
     trainer.gen_kwargs["do_sample"] = True
     trainer.gen_kwargs["top_k"] = 50
     trainer.gen_kwargs["temperature"] = 1.2
-    trainer.gen_kwargs["num_beams"] = 3
+    trainer.gen_kwargs["num_beams"] = 4
     trainer.gen_kwargs["max_new_tokens"] = 64
 
     metrics = trainer.evaluate()
