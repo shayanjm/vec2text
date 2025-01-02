@@ -452,6 +452,13 @@ class InversionModel(transformers.PreTrainedModel):
                 decoder_input_ids_list.append(padded_tokens)
             decoder_input_ids = torch.tensor(decoder_input_ids_list, device=device)
 
+            print("[guided_beam_search] =====================")
+            print(f"  batch_size * beam_size = {batch_size * beam_size}")  # if you have those variables
+            print(f"  inputs_embeds.shape = {inputs_embeds.shape}")
+            print(f"  attention_mask.shape = {attention_mask.shape}")
+            print(f"  decoder_input_ids.shape = {decoder_input_ids.shape}")
+            print("[guided_beam_search] =====================")
+
             # (b) Forward pass (one big batch of size B*beam_size)
             with torch.no_grad():
                 out = self.encoder_decoder(
