@@ -218,7 +218,6 @@ class InversionModel(transformers.PreTrainedModel):
         embedder_attention_mask: Optional[torch.Tensor],
         frozen_embeddings: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        print("[embed_and_project] Entered method")
         assert not ((embedder_input_ids is None) and (frozen_embeddings is None))
 
         # Step 1: Decide whether we're using precomputed/frozen embeddings vs. calling the embedder.
@@ -227,37 +226,28 @@ class InversionModel(transformers.PreTrainedModel):
             assert len(embeddings.shape) == 2, (
                 f"Expected frozen_embeddings to be rank 2 (batch, dim), got shape {embeddings.shape}"
             )
-            print(f"[embed_and_project] Using frozen_embeddings; shape={embeddings.shape}")
         elif self.embedder_no_grad:
-            print("[embed_and_project] embedder_no_grad=True, calling embedding model in no_grad mode")
             with torch.no_grad():
                 embeddings = self.call_embedding_model(
                     input_ids=embedder_input_ids,
                     attention_mask=embedder_attention_mask,
                 )
-            print(f"[embed_and_project] embeddings shape after embedder_no_grad call = {embeddings.shape}")
         else:
-            print("[embed_and_project] embedder_no_grad=False, calling embedding model with grad")
             embeddings = self.call_embedding_model(
                 input_ids=embedder_input_ids,
                 attention_mask=embedder_attention_mask,
             )
-            print(f"[embed_and_project] embeddings shape after embedder call = {embeddings.shape}")
 
         # Step 2: If we're using the "repeat" strategy, do linear transform and reshape into a sequence.
         if self.embedding_transform_strategy == "repeat":
             if embeddings.dtype != self.dtype:
                 embeddings = embeddings.to(self.dtype)
-                print(f"[embed_and_project] Converted embeddings dtype from {embeddings.dtype} to {self.dtype}")
             repeated_embeddings = self.embedding_transform(embeddings)
-            print(f"[embed_and_project] repeated_embeddings shape after linear transform = {repeated_embeddings.shape}")
 
             # linear outputs a big embedding, reshape into a sequence of regular size embeddings.
-            print(f"[embed_and_project] About to reshape with num_repeat_tokens={self.num_repeat_tokens}")
             embeddings = repeated_embeddings.reshape(
                 (*repeated_embeddings.shape[:-1], self.num_repeat_tokens, -1)
             )
-            print(f"[embed_and_project] embeddings shape after reshape = {embeddings.shape}")
         elif self.embedding_transform_strategy == "nearest_neighbors":
             # TODO
             raise NotImplementedError("[embed_and_project] nearest_neighbors strategy not implemented")
@@ -270,9 +260,7 @@ class InversionModel(transformers.PreTrainedModel):
         attention_mask = torch.ones(
             (embeddings.shape[0], embeddings.shape[1]), device=embeddings.device
         )
-        print(f"[embed_and_project] Created attention_mask with shape={attention_mask.shape}")
 
-        print("[embed_and_project] Exiting method\n")
         return embeddings, attention_mask
 
     def generate(
@@ -443,14 +431,6 @@ class InversionModel(transformers.PreTrainedModel):
                 padded_tokens = hyp["tokens"] + [start_token_id] * needed
                 decoder_input_ids_list.append(padded_tokens)
             decoder_input_ids = torch.tensor(decoder_input_ids_list, device=device)
-
-            # Debug prints
-            print("[guided_beam_search] =====================")
-            print(f"  batch_size * beam_size = {batch_size * beam_size}")
-            print(f"  inputs_embeds.shape = {inputs_embeds.shape}")
-            print(f"  attention_mask.shape = {attention_mask.shape}")
-            print(f"  decoder_input_ids.shape = {decoder_input_ids.shape}")
-            print("[guided_beam_search] =====================")
 
             # (b) Forward pass for all beams
             with torch.no_grad():
