@@ -1,9 +1,10 @@
 import copy
 import logging
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Union, Any
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import transformers
 from sentence_transformers import SentenceTransformer
 
@@ -22,27 +23,86 @@ from vec2text.utils import embed_api
 logger = logging.getLogger(__name__)
 
 
+class RefinementBlock(nn.Module):
+    """
+    A small sub-network that refines a previously generated text. 
+    We combine (frozen embedding + partial/hypothesis embedding + partial tokens)
+    to produce improved tokens.
+
+    In this example, we use a separate seq2seq sub-model, but you can simplify 
+    or adapt to your use-case.
+    """
+
+    def __init__(self, config: InversionConfig):
+        super().__init__()
+        self.config = config
+
+        # A small seq2seq sub-model for refinement. e.g., T5 or BART
+        self.encoder_decoder = transformers.AutoModelForSeq2SeqLM.from_pretrained(
+            config.model_name_or_path
+        )
+
+        # We'll assume a default dimension
+        embedder_dim = 1536 if config.embedder_model_api else 768
+        self.embedding_transform = nn.Sequential(
+            nn.Linear(embedder_dim, embedder_dim),
+            nn.GELU(),
+            nn.Linear(embedder_dim, self.encoder_decoder.config.hidden_size),
+        )
+        self.layernorm = nn.LayerNorm(self.encoder_decoder.config.hidden_size)
+
+    def forward_generate(
+        self,
+        frozen_embeddings: torch.Tensor,
+        partial_embeddings: torch.Tensor,
+        partial_ids: torch.Tensor,
+        partial_mask: torch.Tensor,
+        generation_kwargs: Dict[str, Any],
+    ) -> torch.Tensor:
+        """
+        We do a simple approach: combine the two embeddings, prepend them as special tokens, 
+        then call self.encoder_decoder.generate() to produce refined text.
+        """
+        B = frozen_embeddings.size(0)
+        device = frozen_embeddings.device
+
+        # Transform them
+        fe = self.embedding_transform(frozen_embeddings)
+        pe = self.embedding_transform(partial_embeddings)
+        combined = self.layernorm(fe + pe).unsqueeze(1)  # shape [B,1, hidden_size]
+
+        # We'll embed the partial input tokens
+        input_embs = self.encoder_decoder.get_encoder().embed_tokens(partial_ids)
+        # shape: [B, seq_len, hidden_size]
+
+        # Prepend 1 "combined" token
+        new_inputs_embs = torch.cat([combined, input_embs], dim=1)
+        # Build new attention mask
+        extra_ones = torch.ones((B, 1), dtype=partial_mask.dtype, device=device)
+        new_attn_mask = torch.cat([extra_ones, partial_mask], dim=1)
+
+        refine_ids = self.encoder_decoder.generate(
+            inputs_embeds=new_inputs_embs,
+            attention_mask=new_attn_mask,
+            **generation_kwargs
+        )
+        return refine_ids
+
+
 class InversionModel(transformers.PreTrainedModel):
-    """A class of model that conditions on embeddings from a pre-trained sentence embedding model
-    to decode text autoregressively.
+    """
+    Overwrites your existing InversionModel with integrated iterative-refinement logic.
+    This model:
+      1) does a baseline "embedding -> text" decode,
+      2) optionally repeats to refine the text (sub-block "RefinementBlock").
     """
 
     config_class = InversionConfig
     embedder: nn.Module
-    embedder_tokenizer: transformers.PreTrainedTokenizer  # embedder's tokenizer
+    embedder_tokenizer: transformers.PreTrainedTokenizer
     encoder_decoder: transformers.AutoModelForSeq2SeqLM
-    encoder_decoder_lora: bool  # Whether to use LoRA for the encoder-decoder model
-    tokenizer: transformers.PreTrainedTokenizer  # encoder_decoder's tokenizer
-    embedding_transform: nn.Module  # Module that transformers embedder output into encoder-decoder input
-    bottleneck_dim: int  # Bottleneck dimension for embedding_transform
-    num_repeat_tokens: int  # Sequence length for repeating embedder embedding for encoder-decoder input
-    embedder_dim: int  # Hidden dimension of embedding model
-    embedder_no_grad: bool  # Disable gradients for embedding model
-    embedder_fake_with_zeros: bool  # Whether to just provide zeros as input for encoder-decoder (unconditional)
-    embedding_transform_strategy: str  # Way to transform bottleneck embedding into input for encoder-decoder
-    use_frozen_embeddings_as_input: bool  # Whether to train/evaluate on frozen embeddings
-    embedded_tokens: torch.Tensor  # used for decoding
-    embedder_model_api: Optional[str]
+    tokenizer: transformers.PreTrainedTokenizer
+    embedding_transform: nn.Module
 
     def __init__(self, config: InversionConfig):
         super().__init__(config=config)
@@ -54,32 +114,32 @@ class InversionModel(transformers.PreTrainedModel):
         decoder_dropout_disabled = config.decoder_dropout_disabled
         embeddings_from_layer_n = config.embeddings_from_layer_n
 
+        # 1) Load your underlying seq2seq model
         encoder_decoder = load_encoder_decoder(
             model_name=config.model_name_or_path,
             lora=config.use_lora,
         )
 
+        # 2) Load the embedder model + tokenizer
         embedder, embedder_tokenizer = load_embedder_and_tokenizer(
-            name=config.embedder_model_name, torch_dtype=config.embedder_torch_dtype
+            name=config.embedder_model_name,
+            torch_dtype=config.embedder_torch_dtype
         )
 
+        # 3) Load your main tokenizer
         tokenizer = load_tokenizer(
             config.model_name_or_path,
             max_length=config.max_seq_length,
         )
+
         num_repeat_tokens = config.num_repeat_tokens
         embedder_no_grad = config.embedder_no_grad
 
-        self.encoder_decoder = encoder_decoder  # .to_bettertransformer()
-        ######################################################
+        self.encoder_decoder = encoder_decoder
         self.num_repeat_tokens = num_repeat_tokens
 
-        self.embedder_is_decoder = False
-
-        encoder_hidden_dim = self.encoder_decoder.config.hidden_size
+        # Decide dims
         if embedder_model_api:
-            assert use_frozen_embeddings_as_input, "must precompute embeddings w/ api"
-            # Hard-code OpenAI embedding dim
             self.embedder_dim = 1536
             bottleneck_dim = self.embedder_dim
         elif isinstance(embedder, SentenceTransformer):
@@ -88,63 +148,41 @@ class InversionModel(transformers.PreTrainedModel):
         else:
             self.embedder_dim = embedder.config.hidden_size
             bottleneck_dim = self.embedder_dim
+
         self.embedder_no_grad = embedder_no_grad
         self.use_frozen_embeddings_as_input = use_frozen_embeddings_as_input
         self.bottleneck_dim = bottleneck_dim
 
+        encoder_hidden_dim = self.encoder_decoder.config.hidden_size
         self.embedding_transform = nn.Sequential(
             nn.Linear(self.embedder_dim, bottleneck_dim),
             nn.Dropout(self.encoder_decoder.config.dropout_rate),
-            nn.GELU(),  # TODO consider dropout or normalization here.
+            nn.GELU(),
             nn.Linear(bottleneck_dim, encoder_hidden_dim * num_repeat_tokens),
         )
+
         if encoder_dropout_disabled:
             disable_dropout(self.encoder_decoder.encoder)
         if decoder_dropout_disabled:
             disable_dropout(self.encoder_decoder.decoder)
             disable_dropout(self.encoder_decoder.lm_head)
-        ######################################################
+
         self.tokenizer = tokenizer
         self.embedder = embedder
+        self.embedder_tokenizer = embedder_tokenizer
+        self.embedder_model_api = embedder_model_api
+        self.embedder_fake_with_zeros = embedder_fake_with_zeros
+        self.embedding_transform_strategy = "repeat"
+        self.embeddings_from_layer_n = embeddings_from_layer_n
+        self.noise_level = vars(config).get("embedder_gaussian_noise_level", 0.0)
+
         if self.embedder_no_grad:
             for param in self.embedder.parameters():
                 param.requires_grad = False
-
             self.embedder.eval()
 
-        self.embedder_tokenizer = embedder_tokenizer
-        self.embedder_model_api = embedder_model_api
-        # self.freeze(freeze_strategy=config.freeze_strategy)
-        self.embedder_fake_with_zeros = embedder_fake_with_zeros
-
-        self.embedding_transform_strategy = "repeat"  # "none" # "repeat"
-        self.embeddings_from_layer_n = embeddings_from_layer_n
-        self.noise_level = vars(config).get("embedder_gaussian_noise_level")
-
-    def _freeze_encoder(self):
-        freeze_params(self.encoder_decoder.encoder)
-
-    def _freeze_decoder(self):
-        # github.com/huggingface/transformers/blob/master/src/transformers/models/t5/modeling_t5.py#L1229-L1231
-        freeze_params(self.encoder_decoder.decoder)
-        freeze_params(self.encoder_decoder.lm_head)
-
-    def freeze(self, freeze_strategy: str):
-        assert freeze_strategy in FREEZE_STRATEGIES
-
-        if freeze_strategy == "decoder":
-            self._freeze_decoder()
-        elif freeze_strategy == "encoder":
-            self._freeze_encoder()
-        elif freeze_strategy == "encoder_and_decoder":
-            self._freeze_encoder()
-            self._freeze_decoder()
-            # in this case, freeze embeddings too
-            freeze_params(self.encoder_decoder.shared)
-        elif freeze_strategy == "none":
-            pass
-        else:
-            raise ValueError(f"invalid freezing strategy {freeze_strategy}")
+        # (New) a refinement sub-block
+        self.refinement_block = RefinementBlock(config)
 
     @property
     def embedder_device(self) -> torch.device:
@@ -159,9 +197,9 @@ class InversionModel(transformers.PreTrainedModel):
             return outputs.pooler_output
         else:
             if self.embeddings_from_layer_n is not None:
-                assert hasattr(
-                    outputs, "hidden_states"
-                ), "output missing hidden states - did you remember to initialize the model with output_hidden_states=True?"
+                assert hasattr(outputs, "hidden_states"), (
+                    "output missing hidden states - set output_hidden_states=True?"
+                )
                 hidden_state = outputs.hidden_states[self.embeddings_from_layer_n]
                 embeddings = mean_pool(hidden_state, attention_mask)
             else:
@@ -174,12 +212,9 @@ class InversionModel(transformers.PreTrainedModel):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         token_type_ids: Optional[torch.Tensor] = None,
-        # token_type_ids: Optional[torch.Tensor] = None, # not used
     ) -> torch.Tensor:
-        embedder = self.embedder
-        # print("** call_embedding_model")
         if self.embedder_no_grad:
-            embedder.eval()
+            self.embedder.eval()
 
         if self.embedder_fake_with_zeros:
             batch_size = input_ids.shape[0]
@@ -195,14 +230,13 @@ class InversionModel(transformers.PreTrainedModel):
                 api_name=self.embedder_model_api,
             )
         elif isinstance(self.embedder, SentenceTransformer):
-            # sentence-transformers is kind of really annoying
             model_inputs = {"input_ids": input_ids, "attention_mask": attention_mask}
             if token_type_ids is not None:
                 model_inputs["token_type_ids"] = token_type_ids
-            model_output = embedder(model_inputs)
+            model_output = self.embedder(model_inputs)
             embeddings = model_output["sentence_embedding"]
         else:
-            model_output = embedder(input_ids=input_ids, attention_mask=attention_mask)
+            model_output = self.embedder(input_ids=input_ids, attention_mask=attention_mask)
             embeddings = self._process_embedder_output(model_output, attention_mask)
 
         if self.training and self.noise_level > 0:
@@ -217,76 +251,34 @@ class InversionModel(transformers.PreTrainedModel):
         embedder_attention_mask: Optional[torch.Tensor],
         frozen_embeddings: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # print("** embed_and_project")
-        assert not ((embedder_input_ids is None) and (frozen_embeddings is None))
         if frozen_embeddings is not None:
             embeddings = frozen_embeddings
-            assert len(embeddings.shape) == 2  # batch by d
-        elif self.embedder_no_grad:
-            with torch.no_grad():
+            assert embeddings.ndim == 2, "frozen_embeddings must be [B, emb_dim]"
+        else:
+            # We must embed from scratch
+            if self.embedder_no_grad:
+                with torch.no_grad():
+                    embeddings = self.call_embedding_model(
+                        input_ids=embedder_input_ids,
+                        attention_mask=embedder_attention_mask,
+                    )
+            else:
                 embeddings = self.call_embedding_model(
                     input_ids=embedder_input_ids,
                     attention_mask=embedder_attention_mask,
                 )
-        else:
-            embeddings = self.call_embedding_model(
-                input_ids=embedder_input_ids,
-                attention_mask=embedder_attention_mask,
-            )
-        if self.embedding_transform_strategy == "repeat":
-            if embeddings.dtype != self.dtype:
-                embeddings = embeddings.to(self.dtype)
-            repeated_embeddings = self.embedding_transform(embeddings)
-            # linear outputs a big embedding, reshape into a sequence of regular size embeddings.
-            embeddings = repeated_embeddings.reshape(
-                (*repeated_embeddings.shape[:-1], self.num_repeat_tokens, -1)
-            )
-        elif self.embedding_transform_strategy == "nearest_neighbors":
-            # TODO
-            raise NotImplementedError()
-        else:
-            raise ValueError(
-                f"unknown embedding transformation strategy {self.embedding_transform_strategy}"
-            )
+
+        # "repeat" strategy
+        if embeddings.dtype != self.dtype:
+            embeddings = embeddings.to(self.dtype)
+        repeated_embeddings = self.embedding_transform(embeddings)
+        B = repeated_embeddings.shape[0]
+        repeated_embeddings = repeated_embeddings.reshape(B, self.num_repeat_tokens, -1)
+        inputs_embeds = repeated_embeddings
         attention_mask = torch.ones(
-            (embeddings.shape[0], embeddings.shape[1]), device=embeddings.device
+            inputs_embeds.shape[:2], dtype=torch.long, device=inputs_embeds.device
         )
-        return embeddings, attention_mask
-
-    def generate(
-        self,
-        inputs: Dict[str, torch.Tensor],
-        generation_kwargs: Dict[str, torch.Tensor],
-    ) -> torch.Tensor:
-        generation_kwargs = copy.copy(generation_kwargs)  # make a copy so we can edit
-        inputs_embeds, attention_mask = self.embed_and_project(
-            embedder_input_ids=inputs.get("embedder_input_ids"),
-            embedder_attention_mask=inputs.get("embedder_attention_mask"),
-            frozen_embeddings=inputs.get("frozen_embeddings"),
-        )
-
-        if "decoder_input_ids" in inputs:
-            return self.encoder_decoder.generate(
-                # required: input embeddings
-                inputs_embeds=inputs_embeds,
-                attention_mask=attention_mask,
-                # optional: input IDs (for starting generation).
-                # typically not set unless generating prefixes for
-                # reranking.
-                decoder_input_ids=inputs["decoder_input_ids"],
-                # decoder_attention_mask=inputs["decoder_attention_mask"],
-                **generation_kwargs,
-            )
-        else:
-            return self.encoder_decoder.generate(
-                # required: input embeddings
-                inputs_embeds=inputs_embeds,
-                attention_mask=attention_mask,
-                # optional: input IDs (for starting generation).
-                # typically not set unless generating prefixes for
-                # reranking.
-                **generation_kwargs,
-            )
+        return inputs_embeds, attention_mask
 
     def forward(
         self,
@@ -297,7 +289,6 @@ class InversionModel(transformers.PreTrainedModel):
         decoder_input_ids: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Dict[str, torch.Tensor]:
-        # Unused: input_ids, attention_mask
         inputs_embeds, attention_mask = self.embed_and_project(
             embedder_input_ids=embedder_input_ids,
             embedder_attention_mask=embedder_attention_mask,
@@ -309,3 +300,91 @@ class InversionModel(transformers.PreTrainedModel):
             labels=labels,
             decoder_input_ids=decoder_input_ids,
         )
+
+    # ---------------------------------------------------------------------
+    # 1) A helper to do the single-pass base decode
+    # ---------------------------------------------------------------------
+    def _base_generate(
+        self, 
+        inputs: Dict[str, torch.Tensor],
+        generation_kwargs: Dict[str, Any]
+    ) -> torch.Tensor:
+        """
+        The old single-pass approach: embed => project => self.encoder_decoder.generate().
+        """
+        inputs_embeds, attention_mask = self.embed_and_project(
+            embedder_input_ids=inputs.get("embedder_input_ids"),
+            embedder_attention_mask=inputs.get("embedder_attention_mask"),
+            frozen_embeddings=inputs.get("frozen_embeddings"),
+        )
+        return self.encoder_decoder.generate(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            **generation_kwargs
+        )
+
+    def _embed_partial_decode(self, token_ids: torch.Tensor) -> torch.Tensor:
+        """
+        Re-embed a partial or final decode (text) into the same embedding space 
+        as 'frozen_embeddings' for comparison or input to refinement.
+        """
+        text_strs = self.tokenizer.batch_decode(token_ids, skip_special_tokens=True)
+        device = token_ids.device
+        emb_inputs = self.embedder_tokenizer(
+            text_strs, return_tensors="pt", padding=True, truncation=True
+        ).to(device)
+
+        with torch.no_grad():
+            partial_emb = self.call_embedding_model(
+                input_ids=emb_inputs["input_ids"],
+                attention_mask=emb_inputs["attention_mask"],
+            )
+        return partial_emb
+
+    # ---------------------------------------------------------------------
+    # 2) The final .generate() with optional multi-step refinement
+    # ---------------------------------------------------------------------
+    def generate(
+        self,
+        inputs: Dict[str, torch.Tensor],
+        generation_kwargs: Dict[str, Any],
+        refine_steps: int = 0,
+        **kwargs,
+    ) -> torch.Tensor:
+        """
+        Overridden generate that can do:
+          1) Single pass base decode
+          2) If refine_steps>0, repeatedly feed partial decode into self.refinement_block
+        """
+        # 1) do normal single pass
+        base_output = self._base_generate(inputs, generation_kwargs)
+        if refine_steps <= 0:
+            return base_output
+
+        # 2) Iteratively refine
+        current_ids = base_output
+        device = current_ids.device
+
+        # We'll assume we have "frozen_embeddings" in the inputs 
+        # so the refinement block can use it as "target"
+        frozen_embeddings = inputs["frozen_embeddings"].to(device)
+
+        for step_idx in range(refine_steps):
+            # Re-embed the partial decode
+            partial_emb = self._embed_partial_decode(current_ids)
+
+            # The partial decode tokens themselves:
+            # might need to ensure we don't pass pad tokens or huge sequences
+            # We'll do a minimal approach:
+            partial_mask = (current_ids != self.encoder_decoder.config.pad_token_id).long()
+
+            refined_ids = self.refinement_block.forward_generate(
+                frozen_embeddings=frozen_embeddings,
+                partial_embeddings=partial_emb,
+                partial_ids=current_ids,
+                partial_mask=partial_mask,
+                generation_kwargs=generation_kwargs,
+            )
+            current_ids = refined_ids
+
+        return current_ids

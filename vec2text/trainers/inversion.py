@@ -18,7 +18,12 @@ class InversionTrainer(BaseTrainer):
         self.embedder = self.model.embedder
 
     def generate(self, inputs: Dict, generation_kwargs: Dict) -> torch.Tensor:
-        return self.model.generate(inputs=inputs, generation_kwargs=generation_kwargs)
+        """
+        We'll default refine_steps=0 unless the user sets it in generation_kwargs.
+        E.g. they can do generation_kwargs["refine_steps"] = 2
+        """
+        refine_steps = generation_kwargs.pop("refine_steps", 0)
+        return self.model.generate(inputs=inputs, generation_kwargs=generation_kwargs, refine_steps=refine_steps)
 
     def training_step(
         self, model: nn.Module, inputs: Dict[str, torch.Tensor]
