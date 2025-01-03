@@ -7,6 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import transformers
 from transformers import LogitsProcessor, GenerationConfig
+from transformers.generation.logits_process import RepetitionPenaltyLogitsProcessor
 from sentence_transformers import SentenceTransformer
 
 from vec2text.models.config import InversionConfig
@@ -367,12 +368,19 @@ class InversionModel(transformers.PreTrainedModel):
                 checkpoint_interval=checkpoint_interval,
                 batch_size=batch_size
             )
+
+            # Add mild repetition penalty
+            repetition_processor = RepetitionPenaltyLogitsProcessor(penalty=1.1)
+
             # Build a GenerationConfig
             gen_config = GenerationConfig.from_pretrained(self.encoder_decoder.config)
             # Update gen_config with user overrides
             for k, v in generation_kwargs.items():
                 setattr(gen_config, k, v)
-            gen_config.logits_processor = [processor]
+            gen_config.logits_processor = [
+                processor,
+                repetition_processor
+                ]
             outputs = self.encoder_decoder.generate(
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,

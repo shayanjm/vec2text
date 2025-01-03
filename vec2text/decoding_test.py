@@ -107,7 +107,7 @@ try:
     ############################################
     # 4) Guided Decoding + Higher Checkpoint Frequency
     ############################################
-    print(f"\n[Rank {local_rank}] === 4) Guided Decoding, freq=2===")
+    print(f"\n[Rank {local_rank}] === 4) Guided Decoding + Sampling ===")
     trainer.gen_kwargs["guided"] = True
     trainer.gen_kwargs["checkpoint_interval"] = 2
     trainer.gen_kwargs["beam_size"] = 10
@@ -116,7 +116,9 @@ try:
     trainer.gen_kwargs["beta"] = 1.0
     trainer.gen_kwargs["length_penalty"] = 1.0
 
-    trainer.gen_kwargs["do_sample"] = False
+    trainer.gen_kwargs["do_sample"] = True
+    trainer.gen_kwargs["top_k"] = 50
+    trainer.gen_kwargs["temperature"] = 1.0
     trainer.gen_kwargs["num_beams"] = 10
     trainer.gen_kwargs["max_new_tokens"] = 64
 
@@ -126,16 +128,18 @@ try:
     ############################################
     # 5) Multipass Iterative Refinement
     ############################################
-    print(f"\n[Rank {local_rank}] === 5) Multipass Iterative Refinement ===")
+    print(f"\n[Rank {local_rank}] === 5) Multipass Iterative Refinement + Sampling ===")
     trainer.gen_kwargs["guided"] = True
     trainer.gen_kwargs["checkpoint_interval"] = 5
     trainer.gen_kwargs["beam_size"] = 10
-    trainer.gen_kwargs["multipass"] = 5
+    trainer.gen_kwargs["multipass"] = 3
     trainer.gen_kwargs["alpha"] = 1.0
     trainer.gen_kwargs["beta"] = 1.0
     trainer.gen_kwargs["length_penalty"] = 1.2
 
-    trainer.gen_kwargs["do_sample"] = False
+    trainer.gen_kwargs["do_sample"] = True
+    trainer.gen_kwargs["top_k"] = 50
+    trainer.gen_kwargs["temperature"] = 1.0
     trainer.gen_kwargs["num_beams"] = 10
     trainer.gen_kwargs["max_new_tokens"] = 64
 
@@ -200,9 +204,9 @@ try:
     print("[Short Checkpoints & Multipass metrics]", metrics)
 
     ############################################
-    # 8) Looser Generation w/ Temperature + Guidance
+    # 9) Looser Generation w/ Temperature + Guidance
     ############################################
-    print(f"\n[Rank {local_rank}] === 8) Looser Generation + Guidance ===")
+    print(f"\n[Rank {local_rank}] === 9) Looser Generation + Guidance ===")
     trainer.gen_kwargs["guided"] = True
     trainer.gen_kwargs["checkpoint_interval"] = 10
     trainer.gen_kwargs["beam_size"] = 10
