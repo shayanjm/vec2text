@@ -67,7 +67,7 @@ class RefinementBlock(nn.Module):
 
         # embed partial tokens
         input_embs = self.encoder_decoder.get_encoder().embed_tokens(partial_ids) 
-        new_inputs_embs = torch.cat([combined, input_embs], dim=1)
+        new_inputs_embs = torch.cat([combined, input_embs], dim=1).contiguous()
 
         extra_ones = torch.ones((B, 1), dtype=partial_mask.dtype, device=device)
         new_attn_mask = torch.cat([extra_ones, partial_mask], dim=1)
@@ -230,7 +230,7 @@ class InversionModel(transformers.PreTrainedModel):
                 # re-embed the partial decode -> partial_emb
                 partial_emb = self._embed_partial_ids(partial_ids)
                 # combine partial_emb with base_hidden
-                combined = (base_hidden + partial_emb) * 0.5
+                combined = ((base_hidden + partial_emb) * 0.5).contiguous()
             else:
                 combined = base_hidden
 
