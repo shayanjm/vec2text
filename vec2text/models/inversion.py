@@ -230,11 +230,12 @@ class InversionModel(transformers.PreTrainedModel):
                 # re-embed the partial decode -> partial_emb
                 partial_emb = self._embed_partial_ids(partial_ids)
                 # combine partial_emb with base_hidden
-                combined = ((base_hidden + partial_emb) * 0.5).contiguous()
+                combined = (base_hidden + partial_emb) * 0.5
             else:
                 combined = base_hidden
 
             # shape => [B,1, hidden_size]
+            combined = combined.contiguous()
             combined = combined.unsqueeze(1)
 
             # We'll pass combined as an "inputs_embeds" for the encoder
