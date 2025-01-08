@@ -111,6 +111,7 @@ def compute_cycle_consistency_loss(
 # ------------------------------------------------------------------------------
 class InversionTrainer(BaseTrainer):
     def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
         # Extended UncertaintyLoss with 4 log_sigma params
         self.uncertainty_loss = UncertaintyLoss()
 
