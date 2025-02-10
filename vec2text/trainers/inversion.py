@@ -19,6 +19,15 @@ class InversionTrainer(BaseTrainer):
 
     def generate(self, inputs: Dict, generation_kwargs: Dict) -> torch.Tensor:
         return self.model.generate(inputs=inputs, generation_kwargs=generation_kwargs)
+    
+    def compute_loss(self, model, inputs, return_outputs=False):
+        outputs = model(**inputs)
+        # outputs might have "loss" and "diffusion_loss"
+        loss = outputs["loss"]
+        diffusion_loss = outputs.get("diffusion_loss", None)
+        if diffusion_loss is not None:
+            self.log({"train/diffusion_loss": diffusion_loss.detach().item()})
+        return (loss, outputs) if return_outputs else loss
 
     def training_step(
         self, model: nn.Module, inputs: Dict[str, torch.Tensor], num_items_in_batch=None
