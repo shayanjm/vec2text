@@ -231,10 +231,9 @@ class GuidedDiffusion(nn.Module):
         new_embs = []
         for text in texts:
             tokenized = pm.embedder_tokenizer([text], return_tensors="pt", padding=True, truncation=True).to(device)
-            emb = embed_api(
+            emb = pm.call_embedding_model(
                 input_ids=tokenized["input_ids"],
-                embedder_tokenizer=pm.embedder_tokenizer,
-                api_name=pm.embedder_model_api,
+                attention_mask=tokenized["attention_mask"],
             )
             new_embs.append(emb)
         new_embs = torch.cat(new_embs, dim=0)  # (B, embed_dim)
@@ -271,10 +270,9 @@ class GuidedDiffusion(nn.Module):
             new_embs_pert = []
             for txt in texts_pert:
                 tkn = pm.embedder_tokenizer([txt], return_tensors="pt").to(device)
-                emb_pert = embed_api(
+                emb_pert = pm.call_embedding_model(
                     input_ids=tkn["input_ids"],
                     attention_mask=tkn["attention_mask"],
-                    api_name=pm.embedder_model_api,
                 )
                 new_embs_pert.append(emb_pert)
             new_embs_pert = torch.cat(new_embs_pert, dim=0)
@@ -313,10 +311,9 @@ class GuidedDiffusion(nn.Module):
         new_embs = []
         for text in texts:
             tkn = pm.embedder_tokenizer([text], return_tensors="pt").to(device)
-            emb = embed_api(
+            emb = pm.call_embedding_model(
                 input_ids=tkn["input_ids"],
-                embedder_tokenizer=pm.embedder_tokenizer,
-                api_name=pm.embedder_model_api,
+                attention_mask=tkn["attention_mask"]
             )
             new_embs.append(emb)
         new_embs = torch.cat(new_embs, dim=0)
@@ -404,10 +401,9 @@ class GuidedDiffusion(nn.Module):
         new_embs = []
         for text in texts:
             tokenized = pm.embedder_tokenizer([text], return_tensors="pt", padding=True, truncation=True).to(device)
-            emb = embed_api(
+            emb = pm.call_embedding_model(
                 input_ids=tokenized["input_ids"],
-                embedder_tokenizer=pm.embedder_tokenizer,
-                api_name=pm.embedder_model_api,
+                attention_mask=tokenized["attention_mask"]
             )
             new_embs.append(emb)
         new_embs = torch.cat(new_embs, dim=0)
@@ -436,10 +432,9 @@ class GuidedDiffusion(nn.Module):
             new_embs_pert = []
             for txt in texts_pert:
                 tkn = pm.embedder_tokenizer([txt], return_tensors="pt").to(device)
-                emb_pert = embed_api(
+                emb_pert = pm.call_embedding_model(
                     input_ids=tkn["input_ids"],
                     attention_mask=tkn["attention_mask"],
-                    api_name=pm.embedder_model_api,
                 )
                 new_embs_pert.append(emb_pert)
             new_embs_pert = torch.cat(new_embs_pert, dim=0)
