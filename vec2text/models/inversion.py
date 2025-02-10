@@ -93,7 +93,9 @@ class GuidedDiffusion(nn.Module):
     """
     def __init__(
         self,
-        parent_model,      # reference to the parent InversionModel for partial decoding
+        decode_callback,
+        embedder_tokenizer,
+        embedder_model_api: str,
         latent_dim=256,
         timesteps=50,
         anchor_weight=0.01,
@@ -101,7 +103,9 @@ class GuidedDiffusion(nn.Module):
         guidance_finite_diff_eps=1e-3,
     ):
         super().__init__()
-        self.parent_model = parent_model
+        self.decode_callback = decode_callback
+        self.embedder_tokenizer = embedder_tokenizer
+        self.embedder_model_api = embedder_model_api
         self.latent_dim = latent_dim
         self.timesteps = timesteps
         self.anchor_weight = anchor_weight
@@ -222,7 +226,7 @@ class GuidedDiffusion(nn.Module):
             lat_mean = x0_pred
 
         # decode => text
-        texts = self.parent_model._decode_latent_to_text(lat_mean)
+        texts = self.decode_callback(lat_mean)
 
         # re-embed
         new_embs = []
@@ -605,7 +609,9 @@ class InversionModel(transformers.PreTrainedModel):
         # build submodule
         if self.use_diffusion:
             self.guided_diffusion = GuidedDiffusion(
-                parent_model=self,
+                decode_callback=self._decode_latent_to_text,
+                embedder_tokenizer=self.embedder_tokenizer,
+                embedder_model_api=self.embedder_model_api,
                 latent_dim=self.latent_dim,
                 timesteps=self.diffusion_timesteps,
                 anchor_weight=self.diffusion_anchor_weight,
