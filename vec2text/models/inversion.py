@@ -1,5 +1,7 @@
 import copy
 import logging
+import weakref  # add weakref for parent_model references
+
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -90,12 +92,11 @@ class GuidedDiffusion(nn.Module):
       - Anchor loss
       - Optional guidance calls to embedding API (both training & inference)
       - Finite-difference approximation if black-box embedding
+      - Uses a weak reference to the parent model to avoid recursion.
     """
     def __init__(
         self,
-        decode_callback,
-        embedder_tokenizer,
-        embedder_model_api: str,
+        parent_model,  # a strong ref is replaced by a weak ref below
         latent_dim=256,
         timesteps=50,
         anchor_weight=0.01,
@@ -103,9 +104,10 @@ class GuidedDiffusion(nn.Module):
         guidance_finite_diff_eps=1e-3,
     ):
         super().__init__()
-        self.decode_callback = decode_callback
-        self.embedder_tokenizer = embedder_tokenizer
-        self.embedder_model_api = embedder_model_api
+
+        # Store a WEAK reference to avoid cyc recursion:
+        self._parent_ref = weakref.ref(parent_model)
+
         self.latent_dim = latent_dim
         self.timesteps = timesteps
         self.anchor_weight = anchor_weight
@@ -130,6 +132,12 @@ class GuidedDiffusion(nn.Module):
             num_layers=2,
             num_heads=4,
         )
+
+    def _parent(self):
+        """
+        Utility to get the parent model (or None if it's gone).
+        """
+        return self._parent_ref()
 
     def q_sample(self, z0, t, noise=None):
         """
@@ -181,26 +189,12 @@ class GuidedDiffusion(nn.Module):
 
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # [TRAINING-TIME GUIDANCE]
-        # We'll do partial decode if training_guidance_scale>0 and 
-        # step_count % training_guidance_freq==0. 
-        # You can track a global or local step counter to decide whether to skip.
-        # We'll do a simple approach: if 'training_guidance_freq==1' => do it every iteration (very expensive).
-        # If 'training_guidance_freq=5000', you might do it rarely, etc.
-        # For demonstration, let's do a naive approach: always do it if scale>0. 
-        # In a real pipeline, you'd store a global step in parent_model and check if (global_step % freq==0).
-        # We'll show an example "if training_guidance_scale>0"
-
-        if training_guidance_scale>0.0 and (training_guidance_freq<99999999):
-            # partial decode => embed => measure => nudge x0_pred
-            # We'll do a direct finite difference approach on a random subset of dims
-            # just like inference code. This can be extremely slow for large batch sizes.
-
+        if (training_guidance_scale>0.0) and (training_guidance_freq<99999999):
             x0_pred = self.apply_embedding_guidance_training(
                 x0_pred,
-                z0,  # the "target" might just be the original latent if we want to reconstruct
+                z0,
                 training_guidance_scale,
             )
-
             guidance_loss = self._compute_guidance_loss(x0_pred, z0)
             total_loss = total_loss + guidance_loss
 
@@ -216,8 +210,13 @@ class GuidedDiffusion(nn.Module):
         partial decode => embed => measure alignment with the original embedding 
         or some reference. We'll assume we want to match the *same* embedding as z0 
         i.e. invert them. 
-        But you might want to store a separate "target_embedding_for_training" in your parent.
+        If you want a separate target, store it in the parent's e.g. `_training_target_emb`.
         """
+        pm = self._parent()
+        if pm is None:
+            # parent is gone, skip
+            return x0_pred
+
         device = x0_pred.device
         B, L, D = x0_pred.shape
         if L>1:
@@ -225,38 +224,27 @@ class GuidedDiffusion(nn.Module):
         else:
             lat_mean = x0_pred
 
-        # decode => text
-        texts = self.decode_callback(lat_mean)
+        # step A: decode => text
+        texts = pm._decode_latent_to_text(lat_mean)
 
-        # re-embed
+        # step B: embed
         new_embs = []
         for text in texts:
-            tokenized = self.parent_model.embedder_tokenizer([text], return_tensors="pt", padding=True, truncation=True).to(device)
+            tokenized = pm.embedder_tokenizer([text], return_tensors="pt", padding=True, truncation=True).to(device)
             emb = embed_api(
                 input_ids=tokenized["input_ids"],
                 attention_mask=tokenized["attention_mask"],
-                api_name=self.parent_model.embedder_model_api,
+                api_name=pm.embedder_model_api,
             )
             new_embs.append(emb)
         new_embs = torch.cat(new_embs, dim=0)  # (B, embed_dim)
 
-        # compare to "original" embedding. For demonstration, 
-        # let's call your "z0" the original latent in T5 hidden space. 
-        # Actually, you'd want the *embedding* that originally produced z0. 
-        # We'll do a naive approach => we treat "z0" as if it were (B,1,hidden_dim).
-        # That's not quite right if you needed the original text embedding. 
-        # So we might define a "training_target_emb" for each sample in the batch.
-        # But let's be consistent with an approach:
-        # We'll define something like "self.parent_model._training_target_emb" if you want. 
-        # For brevity, let's assume "z0" is the embed we want. We'll do a 
-        # separate line to re-embed that if needed. 
-        # We'll skip for now and do a dummy approach.
-
-        if not hasattr(self.parent_model, "_training_target_emb"):
-            # we can't do a real alignment. We'll skip
+        # step C: get target embedding 
+        # maybe from parent's stored property `_training_target_emb`.
+        if not hasattr(pm, "_training_target_emb"):
+            # can't do alignment
             return x0_pred  
-
-        target_embedding = self.parent_model._training_target_emb  # shape (B, embed_dim)
+        target_embedding = pm._training_target_emb
 
         # measure alignment => e.g. cos similarity
         if self.guidance_mode=="cosine":
@@ -267,7 +255,7 @@ class GuidedDiffusion(nn.Module):
             mse_val = F.mse_loss(new_embs, target_embedding, reduction="none").mean(dim=-1)
             avg_score = -mse_val.mean()
 
-        # do naive finite difference as with inference
+        # step D: naive finite difference for a random subset of dims
         partial_dims = min(10, lat_mean.numel())
         dim_list = torch.randperm(lat_mean.numel(), device=device)[:partial_dims]
         best_update = torch.zeros_like(lat_mean)
@@ -278,15 +266,15 @@ class GuidedDiffusion(nn.Module):
             lat_flat = lat_mean.flatten()
             lat_flat[d] = old_val + eps
             lat_perturbed = lat_flat.view(lat_mean.shape)
-            # decode => embed => measure new score
-            texts_pert = self.parent_model._decode_latent_to_text(lat_perturbed)
+
+            texts_pert = pm._decode_latent_to_text(lat_perturbed)
             new_embs_pert = []
             for txt in texts_pert:
-                tkn = self.parent_model.embedder_tokenizer([txt], return_tensors="pt").to(device)
+                tkn = pm.embedder_tokenizer([txt], return_tensors="pt").to(device)
                 emb_pert = embed_api(
                     input_ids=tkn["input_ids"],
                     attention_mask=tkn["attention_mask"],
-                    api_name=self.parent_model.embedder_model_api,
+                    api_name=pm.embedder_model_api,
                 )
                 new_embs_pert.append(emb_pert)
             new_embs_pert = torch.cat(new_embs_pert, dim=0)
@@ -309,33 +297,33 @@ class GuidedDiffusion(nn.Module):
 
     def _compute_guidance_loss(self, x0_pred, z0):
         """
-        For demonstration, let's define some measure of how well x0_pred is aligned with z0
-        as a 'loss' we add. E.g. if we want them to have high cos sim => we do a negative 
-        of cos sim => more alignment => less loss.
-        We'll do a simple approach:
+        We define a 'guidance_loss' to incorporate partial decode alignment
+        into the training loss. This is just an example. 
         """
-        B, L, D = x0_pred.shape
-        # pretend we have self.parent_model._training_target_emb
-        if not hasattr(self.parent_model, "_training_target_emb"):
+        pm = self._parent()
+        if pm is None or not hasattr(pm, "_training_target_emb"):
             return torch.tensor(0.0, device=x0_pred.device)
-        target_emb = self.parent_model._training_target_emb
 
-        # we decode x0_pred => embed => measure cos => define negative cos as loss
-        texts = self.parent_model._decode_latent_to_text(x0_pred.mean(dim=1, keepdim=True))
+        target_emb = pm._training_target_emb
         device = x0_pred.device
+
+        B, L, D = x0_pred.shape
+        lat_mean = x0_pred.mean(dim=1, keepdim=True)
+        texts = pm._decode_latent_to_text(lat_mean)
         new_embs = []
         for text in texts:
-            tkn = self.parent_model.embedder_tokenizer([text], return_tensors="pt").to(device)
+            tkn = pm.embedder_tokenizer([text], return_tensors="pt").to(device)
             emb = embed_api(
                 input_ids=tkn["input_ids"],
                 attention_mask=tkn["attention_mask"],
-                api_name=self.parent_model.embedder_model_api,
+                api_name=pm.embedder_model_api,
             )
             new_embs.append(emb)
         new_embs = torch.cat(new_embs, dim=0)
+
         cos_sim = F.cosine_similarity(new_embs, target_emb, dim=-1).mean()
         # define negative cos => guidance_loss
-        guidance_loss = -cos_sim  # we want to maximize cos => minimize negative
+        guidance_loss = -cos_sim
         return guidance_loss
 
     def p_sample_loop(
@@ -397,65 +385,61 @@ class GuidedDiffusion(nn.Module):
         """
         1) decode partial latent => text
         2) embed => measure alignment
-        3) do naive finite-diff or a simpler approach => nudge x0_pred
+        3) do naive finite-diff => nudge x0_pred
         """
+        pm = self._parent()
+        if pm is None:
+            return x0_pred
+
         device = x0_pred.device
         B, L, D = x0_pred.shape
 
-        # For multi-token latents, we'll just average them into a single vector
         if L>1:
             lat_mean = x0_pred.mean(dim=1, keepdim=True)
         else:
             lat_mean = x0_pred
 
-        # step A: decode => text
-        texts = self.parent_model._decode_latent_to_text(lat_mean)
+        texts = pm._decode_latent_to_text(lat_mean)
 
-        # step B: re-embed using the model's embedder_model_api
         new_embs = []
         for text in texts:
-            tokenized = self.parent_model.embedder_tokenizer([text], return_tensors="pt", padding=True, truncation=True).to(device)
+            tokenized = pm.embedder_tokenizer([text], return_tensors="pt", padding=True, truncation=True).to(device)
             emb = embed_api(
                 input_ids=tokenized["input_ids"],
                 attention_mask=tokenized["attention_mask"],
-                api_name=self.parent_model.embedder_model_api,
+                api_name=pm.embedder_model_api,
             )
             new_embs.append(emb)
-        new_embs = torch.cat(new_embs, dim=0) # => (B, embed_dim)
+        new_embs = torch.cat(new_embs, dim=0)
 
-        # step C: measure alignment
         if self.guidance_mode=="cosine":
-            # bigger cos => better
-            cos_sim = F.cosine_similarity(new_embs, target_embedding, dim=-1) # (B,)
-            avg_score = cos_sim.mean()
+            cos_sim = F.cosine_similarity(new_embs, target_embedding, dim=-1).mean()
+            avg_score = cos_sim.item()
         else:
-            # MSE
-            mse_loss = F.mse_loss(new_embs, target_embedding, reduction="none").mean(dim=-1)
-            avg_score = -mse_loss.mean()
+            # negative MSE
+            mse_val = F.mse_loss(new_embs, target_embedding)
+            avg_score = -mse_val.item()
 
-        # step D: naive finite difference => extremely expensive if latent_dim is large
-        # We'll do a random subset of dims for demonstration
-        partial_dims = min(10, lat_mean.numel()) # pick 10 or up to total dims
+        # do finite difference
+        partial_dims = min(10, lat_mean.numel())
         dim_list = torch.randperm(lat_mean.numel(), device=device)[:partial_dims]
-
         best_update = torch.zeros_like(lat_mean)
         eps = self.guidance_finite_diff_eps
 
         for d in dim_list:
             old_val = lat_mean.flatten()[d].item()
-            # + eps
             lat_flat = lat_mean.flatten()
             lat_flat[d] = old_val + eps
             lat_perturbed = lat_flat.view(lat_mean.shape)
-            # decode & embed again
-            texts_pert = self.parent_model._decode_latent_to_text(lat_perturbed)
+
+            texts_pert = pm._decode_latent_to_text(lat_perturbed)
             new_embs_pert = []
             for txt in texts_pert:
-                tkn = self.parent_model.embedder_tokenizer([txt], return_tensors="pt").to(device)
+                tkn = pm.embedder_tokenizer([txt], return_tensors="pt").to(device)
                 emb_pert = embed_api(
                     input_ids=tkn["input_ids"],
                     attention_mask=tkn["attention_mask"],
-                    api_name=self.parent_model.embedder_model_api,
+                    api_name=pm.embedder_model_api,
                 )
                 new_embs_pert.append(emb_pert)
             new_embs_pert = torch.cat(new_embs_pert, dim=0)
@@ -464,24 +448,18 @@ class GuidedDiffusion(nn.Module):
             else:
                 new_score = -F.mse_loss(new_embs_pert, target_embedding).item()
 
-            grad_approx = (new_score - avg_score.item()) / eps
-            lat_flat[d] = old_val  # revert
-
+            grad_approx = (new_score - avg_score)/eps
+            lat_flat[d] = old_val
             best_update_flat = best_update.flatten()
             best_update_flat[d] = grad_approx
             best_update = best_update_flat.view(best_update.shape)
 
-        # step E: apply the update
         lat_new = lat_mean + guidance_scale*best_update
-
-        # if L>1 => expand
         if L>1:
             lat_new_exp = lat_new.expand(B,L,D)
         else:
             lat_new_exp = lat_new
-
         return lat_new_exp
-
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # The Original InversionModel with guided diffusion integrated
@@ -609,9 +587,7 @@ class InversionModel(transformers.PreTrainedModel):
         # build submodule
         if self.use_diffusion:
             self.guided_diffusion = GuidedDiffusion(
-                decode_callback=self._decode_latent_to_text,
-                embedder_tokenizer=self.embedder_tokenizer,
-                embedder_model_api=self.embedder_model_api,
+                parent_model=self,
                 latent_dim=self.latent_dim,
                 timesteps=self.diffusion_timesteps,
                 anchor_weight=self.diffusion_anchor_weight,
