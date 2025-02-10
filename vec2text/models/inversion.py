@@ -233,7 +233,7 @@ class GuidedDiffusion(nn.Module):
             tokenized = pm.embedder_tokenizer([text], return_tensors="pt", padding=True, truncation=True).to(device)
             emb = embed_api(
                 input_ids=tokenized["input_ids"],
-                attention_mask=tokenized["attention_mask"],
+                embedder_tokenizer=pm.embedder_tokenizer,
                 api_name=pm.embedder_model_api,
             )
             new_embs.append(emb)
@@ -315,7 +315,7 @@ class GuidedDiffusion(nn.Module):
             tkn = pm.embedder_tokenizer([text], return_tensors="pt").to(device)
             emb = embed_api(
                 input_ids=tkn["input_ids"],
-                attention_mask=tkn["attention_mask"],
+                embedder_tokenizer=pm.embedder_tokenizer,
                 api_name=pm.embedder_model_api,
             )
             new_embs.append(emb)
@@ -406,7 +406,7 @@ class GuidedDiffusion(nn.Module):
             tokenized = pm.embedder_tokenizer([text], return_tensors="pt", padding=True, truncation=True).to(device)
             emb = embed_api(
                 input_ids=tokenized["input_ids"],
-                attention_mask=tokenized["attention_mask"],
+                embedder_tokenizer=pm.embedder_tokenizer,
                 api_name=pm.embedder_model_api,
             )
             new_embs.append(emb)
