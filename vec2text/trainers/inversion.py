@@ -29,8 +29,8 @@ class InversionTrainer(BaseTrainer):
     def compute_loss(self, model, inputs, return_outputs=False):
         outputs = model(**inputs)
         # outputs might have "loss" and "diffusion_loss"
-        loss = outputs["loss"]
-        diffusion_loss = outputs.get("diffusion_loss", None)
+        loss = outputs.loss
+        diffusion_loss = outputs.diffusion_loss
         if diffusion_loss is not None:
             self.log({"train/diffusion_loss": diffusion_loss.detach().item()})
         return (loss, outputs) if return_outputs else loss
