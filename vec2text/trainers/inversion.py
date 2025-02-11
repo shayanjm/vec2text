@@ -11,6 +11,12 @@ from vec2text.trainers.base import BaseTrainer
 class InversionTrainer(BaseTrainer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+
+        # Force teacher forcing at eval
+        self.args.predict_with_generate = False
+        # Ensure we collect the full logits across all eval batches
+        self.args.prediction_loss_only = False
+        
         ######################################################
         self.tokenizer = self.model.tokenizer
         self.embedder_tokenizer = self.model.embedder_tokenizer
