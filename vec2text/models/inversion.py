@@ -2,6 +2,7 @@ import copy
 import logging
 import weakref  # add weakref for parent_model references
 
+from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
 import torch
