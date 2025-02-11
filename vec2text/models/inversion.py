@@ -805,14 +805,14 @@ class InversionModel(transformers.PreTrainedModel):
             embedder_attention_mask=embedder_attention_mask,
             frozen_embeddings=frozen_embeddings,
         )
-        outputs = self.encoder_decoder(
+        seq2seq_outputs = self.encoder_decoder(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             labels=labels,
             decoder_input_ids=decoder_input_ids,
         )
 
-        ce_loss = outputs.loss
+        ce_loss = seq2seq_outputs.loss
         diffusion_loss = None
         total_loss = ce_loss
 
