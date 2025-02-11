@@ -694,38 +694,38 @@ class InversionModel(transformers.PreTrainedModel):
         inputs: Dict[str, torch.Tensor],
         generation_kwargs: Dict[str, torch.Tensor],
     ) -> torch.Tensor:
-        # If diffusion is off => normal generate
+        """
+        Perform diffusion-based generation but return a typical T5 sequence shape [batch, seq_len].
+        """
+        # 0) If diffusion is disabled => do naive approach
         if not self.use_diffusion:
             return self._naive_generate(inputs, generation_kwargs)
 
-        # if diffusion is on => partial noising => reverse steps => decode
-        # 1) embed & project
+        # 1) embed & project => shape [B, orig_seq_len, hidden_dim]
         inputs_embeds, _ = self.embed_and_project(
             embedder_input_ids=inputs.get("embedder_input_ids"),
             embedder_attention_mask=inputs.get("embedder_attention_mask"),
             frozen_embeddings=inputs.get("frozen_embeddings"),
         )
-        # (B, seq_len, hidden_dim), let's do a mean => single lat
-        lat_mean = inputs_embeds.mean(dim=1, keepdim=True) # shape (B,1,hidden_dim)
+        # get single latent [B,1,hidden_dim]
+        lat_mean = inputs_embeds.mean(dim=1, keepdim=True)
 
-        # compress to diffusion latent
+        # 2) partial noising => x_T
         if not hasattr(self, "_diffusion_compress"):
-            # define once
-            self._diffusion_compress = nn.Linear(lat_mean.size(-1), self.latent_dim).to(self.device)
+            self._diffusion_compress = nn.Linear(
+                lat_mean.size(-1), self.latent_dim
+            ).to(self.device)
         z0 = self._diffusion_compress(lat_mean)
-
-        # partial noising
         T = self.diffusion_timesteps
         noise = torch.randn_like(z0)
-        alpha_bar = self.guided_diffusion.alphas_cumprod[T-1].sqrt()
-        xT = alpha_bar*z0 + (1-alpha_bar**2).sqrt()*noise
+        alpha_bar = self.guided_diffusion.alphas_cumprod[T - 1].sqrt()
+        xT = alpha_bar * z0 + (1 - alpha_bar**2).sqrt() * noise
 
+        # get some steps from generation_kwargs or default
         refine_steps = generation_kwargs.pop("refine_steps", T)
-        # optionally pass a "target_embedding" if you want. If you want to guide it back to the same embedding, do z0
-        # or store something in "inputs['target_embedding']"
         target_emb = inputs.get("target_embedding", None)
 
-        # reverse
+        # 3) reverse diffusion => final latent x0
         x0 = self.guided_diffusion.p_sample_loop(
             x_T=xT,
             steps=refine_steps,
@@ -734,19 +734,36 @@ class InversionModel(transformers.PreTrainedModel):
             target_embedding=target_emb,
         )
 
-        # expand back => T5 hidden
+        # 4) expand x0 => shape [B, orig_seq_len, hidden_dim]
         if not hasattr(self, "_diffusion_expand"):
             self._diffusion_expand = nn.Linear(self.latent_dim, lat_mean.size(-1)).to(self.device)
-        expanded = self._diffusion_expand(x0).expand(-1, inputs_embeds.size(1), -1)  # (B, seq_len, hidden_dim)
+        expanded = self._diffusion_expand(x0).expand(-1, inputs_embeds.size(1), -1)
+
+        # 5) call T5 generate => typical shape [batch_size, dec_len]
         attention_mask = torch.ones(
-            (expanded.size(0), expanded.size(1)), dtype=torch.long, device=expanded.device
+            (expanded.size(0), expanded.size(1)),
+            dtype=torch.long,
+            device=expanded.device,
         )
-        # decode with T5
-        return self.encoder_decoder.generate(
+        out_ids = self.encoder_decoder.generate(
             inputs_embeds=expanded,
             attention_mask=attention_mask,
             **generation_kwargs,
         )
+
+        # 6) (Optional) pad to a fixed max_length if you want the same 2D shape
+        max_len = generation_kwargs.get("max_length", 128)
+        if out_ids.size(1) < max_len:
+            pad_amount = max_len - out_ids.size(1)
+            pad_tokens = torch.full(
+                (out_ids.size(0), pad_amount),
+                self.tokenizer.pad_token_id,
+                dtype=out_ids.dtype,
+                device=out_ids.device,
+            )
+            out_ids = torch.cat([out_ids, pad_tokens], dim=1)
+
+        return out_ids
 
     def _naive_generate(self, inputs: Dict[str, torch.Tensor], generation_kwargs: Dict[str, torch.Tensor]) -> torch.Tensor:
         # original approach w/out diffusion
