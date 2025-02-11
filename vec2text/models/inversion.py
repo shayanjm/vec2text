@@ -9,6 +9,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import transformers
 from sentence_transformers import SentenceTransformer
+from transformers.modeling_outputs import Seq2SeqLMOutput
+
 
 from vec2text.models.config import InversionConfig
 from vec2text.models.model_utils import (
@@ -456,6 +458,14 @@ class GuidedDiffusion(nn.Module):
             lat_new_exp = lat_new
         return lat_new_exp
 
+@dataclass
+class DiffusionSeq2SeqLMOutput(Seq2SeqLMOutput):
+    """
+    Extends Seq2SeqLMOutput with extra fields for CE loss and diffusion loss.
+    """
+    ce_loss: Optional[torch.FloatTensor] = None
+    diffusion_loss: Optional[torch.FloatTensor] = None
+
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # The Original InversionModel with guided diffusion integrated
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -800,13 +810,10 @@ class InversionModel(transformers.PreTrainedModel):
             labels=labels,
             decoder_input_ids=decoder_input_ids,
         )
+
         ce_loss = outputs.loss
-        # pack into dict
-        out_dict = {
-            "loss": ce_loss,
-            "ce_loss": ce_loss,
-            "logits": outputs.logits,
-        }
+        diffusion_loss = None
+        total_loss = ce_loss
 
         # (2) if training with diffusion => random step => diffusion_loss
         if self.use_diffusion and self.training:
@@ -823,11 +830,22 @@ class InversionModel(transformers.PreTrainedModel):
                 training_guidance_scale=self.diffusion_training_guidance_scale,
                 training_guidance_freq=self.diffusion_training_guidance_freq,
             )
-            # combine or store separately
-            out_dict["diffusion_loss"] = diff_loss
-            out_dict["loss"] = out_dict["loss"] + 0.1*diff_loss  # weight = 0.1 ?
+            diffusion_loss = diff_loss
+            total_loss = ce_loss + 0.1 * diffusion_loss # Weighting diffusion loss @ 0.1
 
-        return out_dict
+        return DiffusionSeq2SeqLMOutput(
+            loss=total_loss,
+            logits=seq2seq_outputs.logits,
+            past_key_values=seq2seq_outputs.past_key_values,
+            decoder_hidden_states=seq2seq_outputs.decoder_hidden_states,
+            decoder_attentions=seq2seq_outputs.decoder_attentions,
+            cross_attentions=seq2seq_outputs.cross_attentions,
+            encoder_last_hidden_state=seq2seq_outputs.encoder_last_hidden_state,
+            encoder_hidden_states=seq2seq_outputs.encoder_hidden_states,
+            encoder_attentions=seq2seq_outputs.encoder_attentions,
+            ce_loss=ce_loss,
+            diffusion_loss=diffusion_loss,
+        )
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # For partial decode inside guidance
