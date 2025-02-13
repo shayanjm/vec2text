@@ -710,6 +710,7 @@ class InversionModel(transformers.PreTrainedModel):
         """
         # 0) If diffusion is disabled => do naive approach
         if not self.use_diffusion:
+            print("---Not using diffusion---")
             return self._naive_generate(inputs, generation_kwargs)
 
         # 1) embed & project => shape [B, orig_seq_len, hidden_dim]
@@ -749,18 +750,20 @@ class InversionModel(transformers.PreTrainedModel):
         if not hasattr(self, "_diffusion_expand"):
             self._diffusion_expand = nn.Linear(self.latent_dim, lat_mean.size(-1)).to(self.device)
         expanded = self._diffusion_expand(x0).expand(-1, inputs_embeds.size(1), -1)
-
+        print(f"---expanded: {expanded}---")
         # 5) call T5 generate => typical shape [batch_size, dec_len]
         attention_mask = torch.ones(
             (expanded.size(0), expanded.size(1)),
             dtype=torch.long,
             device=expanded.device,
         )
+        print(f"---attention_mask: {attention_mask}---")
         out_ids = self.encoder_decoder.generate(
             inputs_embeds=expanded,
             attention_mask=attention_mask,
             **generation_kwargs,
         )
+        print(f"---out_ids: {out_ids}---")
 
         # 6) (Optional) pad to a fixed max_length if you want the same 2D shape
         max_len = generation_kwargs.get("max_length", 128)
@@ -774,6 +777,7 @@ class InversionModel(transformers.PreTrainedModel):
             )
             out_ids = torch.cat([out_ids, pad_tokens], dim=1)
 
+        print(f"---out_ids FINAL: {out_ids}---")
         return out_ids
 
     def _naive_generate(self, inputs: Dict[str, torch.Tensor], generation_kwargs: Dict[str, torch.Tensor]) -> torch.Tensor:
