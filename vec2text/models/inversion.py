@@ -366,7 +366,7 @@ class GuidedDiffusion(nn.Module):
             # 1: Denoise
             pred_noise = self.denoiser(x_t, z_hat, t_tensor)
             
-            print(f"[p_sample_loop] alphas_cumprod: {self.guided_diffusion.alphas_cumprod}")
+            print(f"[p_sample_loop] alphas_cumprod: {self.alphas_cumprod}")
 
             alpha_bar = self.alphas_cumprod[t_tensor].view(-1,1,1)
             x0_pred = (x_t - (1 - alpha_bar).sqrt() * pred_noise) / (alpha_bar.sqrt() + 1e-7)
