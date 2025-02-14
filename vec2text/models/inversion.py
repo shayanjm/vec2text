@@ -348,10 +348,6 @@ class GuidedDiffusion(nn.Module):
         inference_guidance_freq=1,
         target_embedding: Optional[torch.Tensor] = None,
     ):
-        """
-        Reverse diffusion from x_T => x_0, with partial guidance calls every inference_guidance_freq steps.
-        target_embedding is the embedding we want to match (B, embed_dim).
-        """
         if steps is None:
             steps = self.timesteps
         z_hat = torch.zeros_like(x_T)
@@ -359,13 +355,32 @@ class GuidedDiffusion(nn.Module):
 
         for i in reversed(range(steps)):
             t_tensor = torch.full((x_t.size(0),), i, device=x_t.device, dtype=torch.long)
-            # step 1: denoise
-            pred_noise = self.denoiser(x_t, z_hat, t_tensor)
-            alpha_bar = self.alphas_cumprod[t_tensor].view(-1,1,1)
-            x0_pred = (x_t - (1-alpha_bar).sqrt() * pred_noise) / (alpha_bar.sqrt() + 1e-7)
 
-            # step 2: guidance if i%inference_guidance_freq==0
-            if (inference_guidance_scale > 0.0) and (i % inference_guidance_freq == 0) and (target_embedding is not None):
+            # (A) Print stats for x_t before denoising
+            if i % 5 == 0:  # e.g. print every 5 steps
+                print(f"[p_sample_loop] step={i}, x_t min/mean/max:",
+                    x_t.min().item(),
+                    x_t.mean().item(),
+                    x_t.max().item(), flush=True)
+
+            # 1: Denoise
+            pred_noise = self.denoiser(x_t, z_hat, t_tensor)
+            
+            print(f"[p_sample_loop] alphas_cumprod: {self.guided_diffusion.alphas_cumprod}")
+
+            alpha_bar = self.alphas_cumprod[t_tensor].view(-1,1,1)
+            x0_pred = (x_t - (1 - alpha_bar).sqrt() * pred_noise) / (alpha_bar.sqrt() + 1e-7)
+
+            # (B) Print stats for x0_pred
+            if i % 5 == 0:
+                print(f"[p_sample_loop] step={i}, x0_pred min/mean/max:",
+                    x0_pred.min().item(),
+                    x0_pred.mean().item(),
+                    x0_pred.max().item(),
+                    flush=True)
+
+            # 2: Guidance
+            if (inference_guidance_scale>0.0) and (i % inference_guidance_freq == 0) and (target_embedding is not None):
                 x0_pred = self.apply_embedding_guidance(
                     x0_pred,
                     inference_guidance_scale,
@@ -374,22 +389,37 @@ class GuidedDiffusion(nn.Module):
 
             z_hat = x0_pred.detach()
 
-            # step 3: sample posterior
+            # 3: Sample posterior (unless i==0)
             if i > 0:
                 beta_t = self.betas[t_tensor].view(-1,1,1)
                 alpha_bar_prev = self.alphas_cumprod[t_tensor - 1].view(-1,1,1)
-                denom = ( (1 - alpha_bar).sqrt() + 1e-7 )
+                denom = (1 - alpha_bar).sqrt() + 1e-7
+
                 mean = (
                     x0_pred * alpha_bar_prev.sqrt()
                     + (x_t - x0_pred * alpha_bar.sqrt()) * (1 - alpha_bar_prev).sqrt()
                 ) / denom
+
                 var = beta_t * (1 - alpha_bar_prev) / (1 - alpha_bar)
                 noise = torch.randn_like(x_t)
+
+                # (C) Print stats for mean, var if you suspect negativity or huge values:
+                if i % 5 == 0:
+                    print(f"[p_sample_loop] step={i}, mean min/mean/max:",
+                        mean.min().item(),
+                        mean.mean().item(),
+                        mean.max().item(),
+                        flush=True)
+                    print(f"[p_sample_loop] step={i}, var min/mean/max:",
+                        var.min().item(),
+                        var.mean().item(),
+                        var.max().item(),
+                        flush=True)
+                
                 x_t = mean + var.sqrt() * noise
-            else:
-                x_t = x0_pred
 
         return x_t
+
 
     def apply_embedding_guidance(
         self,
@@ -736,6 +766,8 @@ class InversionModel(transformers.PreTrainedModel):
         if not hasattr(self, "_diffusion_compress"):
             self._diffusion_compress = nn.Linear(lat_mean.size(-1), self.latent_dim).to(self.device)
         z0 = self._diffusion_compress(lat_mean)
+        print(f"--generate() :: z0: {z0}")
+        print(f"--generate() :: z0 min/mean/max: {z0.min()}, {z0.mean()}, {z0.max()}")
         T = self.diffusion_timesteps
         noise = torch.randn_like(z0)
 
