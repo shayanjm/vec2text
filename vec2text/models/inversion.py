@@ -45,22 +45,36 @@ def debug_print(*args, **kwargs):
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 class CosineScheduler:
-    """Cosine schedule for betas over T timesteps."""
+    """
+    Modified Cosine schedule for betas over T timesteps, 
+    with an additional clamp so that alpha = 1 - beta never exceeds 0.995.
+    This avoids alpha being too close to 1.0.
+    """
     def __init__(self, timesteps=50, beta_start=1e-4, beta_end=0.02):
         import math
         self.timesteps = timesteps
         betas = []
+        max_alpha = 0.995  # clamp alpha <= 0.995
+
         for i in range(timesteps):
             f = i / (timesteps - 1)
             cos_val = 0.5 * (1 - math.cos(math.pi * f))
-            beta = beta_start + cos_val * (beta_end - beta_start)
+            raw_beta = beta_start + cos_val * (beta_end - beta_start)
+            # Now convert to alpha = 1 - beta
+            alpha = 1.0 - raw_beta
+            # clamp alpha to avoid it being too close to 1
+            alpha = min(alpha, max_alpha)
+            # recast to beta after clamp
+            beta = 1.0 - alpha
             betas.append(beta)
+
         self.betas = torch.tensor(betas, dtype=torch.float32)
 
 
 class SelfConditionedDenoiser(nn.Module):
     """
     A basic Transformer-based denoiser that self-conditions on previous step's predicted x0.
+    We'll use it to predict v (velocity) instead of raw noise, for stability.
     """
     def __init__(self, latent_dim=256, hidden_dim=1024, time_embed_dim=256, num_layers=2, num_heads=4):
         super().__init__()
@@ -78,6 +92,7 @@ class SelfConditionedDenoiser(nn.Module):
 
     def forward(self, z_t, z_hat, t):
         """
+        We interpret this output as "v_pred" (the velocity).
         z_t, z_hat: shape (B,L,latent_dim) typically L=1 for single-vector latents
         t: shape (B,) integer timesteps
         """
@@ -96,22 +111,24 @@ class SelfConditionedDenoiser(nn.Module):
 
         h = self.transformer(h)
         out = self.out_proj(h)   # => (B,L,latent_dim)
+        # We interpret out as v_pred
         return out
 
 
 class GuidedDiffusion(nn.Module):
     """
     Full diffusion submodule with:
-      - Cosine schedule
+      - Cosine schedule (with alpha clamp)
       - Self-conditioning
       - Anchor loss
-      - Optional guidance calls to embedding API (both training & inference)
+      - v-pred for stable training
+      - Optional guidance calls
       - Finite-difference approximation if black-box embedding
-      - Uses a weak reference to the parent model to avoid recursion.
+      - Safe clamps in the reverse pass
     """
     def __init__(
         self,
-        parent_model,  # a strong ref is replaced by a weak ref below
+        parent_model,
         latent_dim=256,
         timesteps=50,
         anchor_weight=0.01,
@@ -131,11 +148,11 @@ class GuidedDiffusion(nn.Module):
         self.guidance_mode = guidance_mode
         self.guidance_finite_diff_eps = guidance_finite_diff_eps
 
-        # create a cosine schedule
+        # create a safer cosine schedule
         sched = CosineScheduler(timesteps, beta_start=1e-4, beta_end=0.02)
         self.register_buffer("betas", sched.betas)
 
-        alphas = 1.0 - sched.betas
+        alphas = 1.0 - sched.betas  # already clamped inside CosineScheduler
         alphas_cumprod = torch.cumprod(alphas, dim=0)
         # Defensive clamp to [0,1]
         alphas_cumprod = torch.clamp(alphas_cumprod, 0.0, 1.0)
@@ -143,7 +160,7 @@ class GuidedDiffusion(nn.Module):
         self.register_buffer("alphas", alphas)
         self.register_buffer("alphas_cumprod", alphas_cumprod)
 
-        # define the denoiser
+        # define the denoiser (which will produce v-pred)
         self.denoiser = SelfConditionedDenoiser(
             latent_dim=latent_dim,
             hidden_dim=4*latent_dim,
@@ -153,9 +170,7 @@ class GuidedDiffusion(nn.Module):
         )
 
     def _parent(self):
-        """
-        Utility to get the parent model (or None if it's gone).
-        """
+        """Utility to get the parent model (or None if it's gone)."""
         return self._parent_ref()
 
     def q_sample(self, z0, t, noise=None):
@@ -164,7 +179,7 @@ class GuidedDiffusion(nn.Module):
         """
         if noise is None:
             noise = torch.randn_like(z0)
-        alpha_bar = self.alphas_cumprod[t].view(-1,1,1)  # in [0..1], ideally
+        alpha_bar = self.alphas_cumprod[t].view(-1,1,1)
         return alpha_bar.sqrt() * z0 + (1 - alpha_bar).sqrt() * noise
 
     def forward(
@@ -176,49 +191,55 @@ class GuidedDiffusion(nn.Module):
         training_guidance_freq=99999999,
     ):
         """
-        Called in training. We:
-          1) pick random t
-          2) add noise
-          3) predict noise
-          4) anchor => x0_pred near z0
-          5) optionally do partial decode & guidance if training_guidance_scale>0 
-             and we haven't done it too frequently
+        Called in training.
+          We do v-pred:
+            v_target = sqrt(alpha_bar)*noise - sqrt(1-alpha_bar)*z0
+            v_pred = denoiser(...)
+            we do MSE on v_pred vs. v_target
         """
         B, L, D = z0.shape
         if t is None:
             t = torch.randint(0, self.timesteps, (B,), device=z0.device)
 
-        # step 1: forward diffuse
+        # (1) forward diffuse
         noise = torch.randn_like(z0)
         z_t = self.q_sample(z0, t, noise=noise)
 
         if z_hat is None:
             z_hat = torch.zeros_like(z_t)
 
-        # step 2: predict noise
-        pred_noise = self.denoiser(z_t, z_hat, t)
-        noise_mse = F.mse_loss(pred_noise, noise)
-
-        # step 3: anchor
         alpha_bar = self.alphas_cumprod[t].view(-1,1,1)
+        # (2) v-target
+        # v = sqrt(alpha)*noise - sqrt(1-alpha)*z0
+        v_target = alpha_bar.sqrt() * noise - (1 - alpha_bar).sqrt() * z0
+
+        # predict v
+        v_pred = self.denoiser(z_t, z_hat, t)
+        v_mse = F.mse_loss(v_pred, v_target)
+
+        # from v_pred, we can infer the predicted noise:
+        # pred_noise = (v_pred + sqrt(1-alpha)*z0) / sqrt(alpha)
+        pred_noise = (v_pred + (1 - alpha_bar).sqrt()*z0) / (alpha_bar.sqrt() + 1e-7)
+
+        # anchor => x0_pred near z0
         x0_pred = (z_t - (1 - alpha_bar).sqrt() * pred_noise) / (alpha_bar.sqrt() + 1e-7)
         anchor_loss = F.mse_loss(x0_pred, z0)
 
-        total_loss = noise_mse + self.anchor_weight * anchor_loss
+        total_loss = v_mse + self.anchor_weight * anchor_loss
 
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # [TRAINING-TIME GUIDANCE]
         if (training_guidance_scale > 0.0) and (training_guidance_freq < 99999999):
-            x0_pred = self.apply_embedding_guidance_training(
+            x0_guided = self.apply_embedding_guidance_training(
                 x0_pred,
                 z0,
                 training_guidance_scale,
             )
-            guidance_loss = self._compute_guidance_loss(x0_pred, z0)
+            guidance_loss = self._compute_guidance_loss(x0_guided, z0)
             total_loss = total_loss + guidance_loss
 
         return total_loss
-    
+
     def apply_embedding_guidance_training(
         self,
         x0_pred: torch.Tensor,
@@ -227,24 +248,23 @@ class GuidedDiffusion(nn.Module):
     ) -> torch.Tensor:
         """
         partial decode => embed => measure alignment with the original embedding 
-        or some reference. We'll assume we want to match the *same* embedding as z0.
+        or some reference. We'll assume we want to match the same embedding as z0.
         """
         pm = self._parent()
         if pm is None:
-            # parent is gone, skip
             return x0_pred
 
         device = x0_pred.device
         B, L, D = x0_pred.shape
-        if L>1:
+        if L > 1:
             lat_mean = x0_pred.mean(dim=1, keepdim=True)
         else:
             lat_mean = x0_pred
 
-        # step A: decode => text
+        # decode => text
         texts = pm._decode_latent_to_text(lat_mean)
 
-        # step B: embed
+        # embed
         new_embs = []
         for text in texts:
             tokenized = pm.embedder_tokenizer([text], return_tensors="pt", padding=True, truncation=True).to(device)
@@ -253,23 +273,20 @@ class GuidedDiffusion(nn.Module):
                 attention_mask=tokenized["attention_mask"],
             )
             new_embs.append(emb)
-        new_embs = torch.cat(new_embs, dim=0)  # (B, embed_dim)
+        new_embs = torch.cat(new_embs, dim=0)
 
         if not hasattr(pm, "_training_target_emb"):
-            # can't do alignment
             return x0_pred  
         target_embedding = pm._training_target_emb
 
-        # measure alignment => e.g. cos similarity
         if self.guidance_mode == "cosine":
             cos_sim = F.cosine_similarity(new_embs, target_embedding, dim=-1) 
             avg_score = cos_sim.mean()
         else:
-            # mse
             mse_val = F.mse_loss(new_embs, target_embedding, reduction="none").mean(dim=-1)
             avg_score = -mse_val.mean()
 
-        # step D: naive finite difference for a random subset of dims
+        # naive finite difference on lat_mean
         partial_dims = min(10, lat_mean.numel())
         dim_list = torch.randperm(lat_mean.numel(), device=device)[:partial_dims]
         best_update = torch.zeros_like(lat_mean)
@@ -298,7 +315,6 @@ class GuidedDiffusion(nn.Module):
                 new_score = -F.mse_loss(new_embs_pert, target_embedding).item()
 
             grad_approx = (new_score - avg_score.item()) / eps
-            # revert
             old_flat[d] = old_val
 
             best_update_flat = best_update.flatten()
@@ -311,10 +327,6 @@ class GuidedDiffusion(nn.Module):
         return lat_new
 
     def _compute_guidance_loss(self, x0_pred, z0):
-        """
-        We define a 'guidance_loss' to incorporate partial decode alignment
-        into the training loss.
-        """
         pm = self._parent()
         if pm is None or not hasattr(pm, "_training_target_emb"):
             return torch.tensor(0.0, device=x0_pred.device)
@@ -336,10 +348,9 @@ class GuidedDiffusion(nn.Module):
         new_embs = torch.cat(new_embs, dim=0)
 
         cos_sim = F.cosine_similarity(new_embs, target_emb, dim=-1).mean()
-        # define negative cos => guidance_loss
         guidance_loss = -cos_sim
         return guidance_loss
-
+    
     def p_sample_loop(
         self,
         x_T,
@@ -348,77 +359,103 @@ class GuidedDiffusion(nn.Module):
         inference_guidance_freq=1,
         target_embedding: Optional[torch.Tensor] = None,
     ):
+        """
+        Reverse diffusion from x_T => x_0, with partial guidance calls every
+        inference_guidance_freq steps, using a consistent v-pred approach.
+        """
         if steps is None:
             steps = self.timesteps
-        z_hat = torch.zeros_like(x_T)
-        x_t = x_T
+
+        x_t = x_T.clone()
+        # optional: just store z_hat if you do self-conditioning at inference
+        z_hat = torch.zeros_like(x_t)
 
         for i in reversed(range(steps)):
             t_tensor = torch.full((x_t.size(0),), i, device=x_t.device, dtype=torch.long)
 
-            # (A) Print stats for x_t before denoising
-            if i % 5 == 0:  # e.g. print every 5 steps
-                print(f"[p_sample_loop] step={i}, x_t min/mean/max:",
-                    x_t.min().item(),
-                    x_t.mean().item(),
-                    x_t.max().item(), flush=True)
-
-            # 1: Denoise
-            pred_noise = self.denoiser(x_t, z_hat, t_tensor)
-            
-            print(f"[p_sample_loop] alphas_cumprod: {self.alphas_cumprod}")
-
-            alpha_bar = self.alphas_cumprod[t_tensor].view(-1,1,1)
-            x0_pred = (x_t - (1 - alpha_bar).sqrt() * pred_noise) / (alpha_bar.sqrt() + 1e-7)
-
-            # (B) Print stats for x0_pred
             if i % 5 == 0:
-                print(f"[p_sample_loop] step={i}, x0_pred min/mean/max:",
-                    x0_pred.min().item(),
-                    x0_pred.mean().item(),
-                    x0_pred.max().item(),
-                    flush=True)
+                print(
+                    f"[p_sample_loop] step={i}, x_t min/mean/max: "
+                    f"{x_t.min().item()}, {x_t.mean().item()}, {x_t.max().item()}",
+                    flush=True
+                )
 
-            # 2: Guidance
-            if (inference_guidance_scale>0.0) and (i % inference_guidance_freq == 0) and (target_embedding is not None):
+            # -------------------------------------------------
+            # (1) predict v from the current sample x_t
+            v_pred = self.denoiser(x_t, z_hat, t_tensor)
+
+            # -------------------------------------------------
+            # (2) get alpha_bar[t], then compute eps_pred
+            # v = sqrt(a)*eps - sqrt(1-a)* x_t
+            # => eps = ( v + sqrt(1-a)* x_t ) / sqrt(a)
+            alpha_bar = self.alphas_cumprod[t_tensor].view(-1, 1, 1)
+            eps_pred = (v_pred + (1 - alpha_bar).sqrt() * x_t) / (alpha_bar.sqrt() + 1e-7)
+
+            # -------------------------------------------------
+            # (3) Now get x0_pred from x_t and eps_pred
+            # x0 = ( x_t - sqrt(1-a)*eps ) / sqrt(a)
+            x0_pred = (x_t - (1 - alpha_bar).sqrt() * eps_pred) / (alpha_bar.sqrt() + 1e-7)
+
+            if i % 5 == 0:
+                print(
+                    f"[p_sample_loop] step={i}, x0_pred min/mean/max: "
+                    f"{x0_pred.min().item()}, {x0_pred.mean().item()}, {x0_pred.max().item()}",
+                    flush=True
+                )
+
+            # -------------------------------------------------
+            # (4) If inference guidance is used, apply partial decode guidance
+            if (
+                inference_guidance_scale > 0.0
+                and (i % inference_guidance_freq == 0)
+                and (target_embedding is not None)
+            ):
                 x0_pred = self.apply_embedding_guidance(
                     x0_pred,
                     inference_guidance_scale,
                     target_embedding=target_embedding,
                 )
 
+            # optional: for self-conditioning, you might do z_hat = x0_pred or similar
             z_hat = x0_pred.detach()
 
-            # 3: Sample posterior (unless i==0)
+            # -------------------------------------------------
+            # (5) If not the final step, sample x_{t-1}
             if i > 0:
-                beta_t = self.betas[t_tensor].view(-1,1,1)
-                alpha_bar_prev = self.alphas_cumprod[t_tensor - 1].view(-1,1,1)
-                denom = (1 - alpha_bar).sqrt() + 1e-7
+                beta_t = self.betas[t_tensor].view(-1, 1, 1)
+                alpha_bar_prev = self.alphas_cumprod[t_tensor - 1].view(-1, 1, 1)
 
+                # clamp to avoid near-zero denominators
+                safe_denom = torch.clamp((1 - alpha_bar).sqrt(), min=1e-4)
+
+                # standard DDPM posterior: 
+                #    mean = sqrt(alpha_{t-1}) * x_0_pred + ...
+                # but we keep your code's approach with the safe_denom
                 mean = (
                     x0_pred * alpha_bar_prev.sqrt()
                     + (x_t - x0_pred * alpha_bar.sqrt()) * (1 - alpha_bar_prev).sqrt()
-                ) / denom
+                ) / (safe_denom + 1e-7)
 
-                var = beta_t * (1 - alpha_bar_prev) / (1 - alpha_bar)
+                var = beta_t * (1 - alpha_bar_prev) / torch.clamp((1 - alpha_bar), min=1e-4)
                 noise = torch.randn_like(x_t)
 
-                # (C) Print stats for mean, var if you suspect negativity or huge values:
                 if i % 5 == 0:
-                    print(f"[p_sample_loop] step={i}, mean min/mean/max:",
-                        mean.min().item(),
-                        mean.mean().item(),
-                        mean.max().item(),
-                        flush=True)
-                    print(f"[p_sample_loop] step={i}, var min/mean/max:",
-                        var.min().item(),
-                        var.mean().item(),
-                        var.max().item(),
-                        flush=True)
-                
+                    print(
+                        f"[p_sample_loop] step={i}, mean min/mean/max: "
+                        f"{mean.min().item()}, {mean.mean().item()}, {mean.max().item()}",
+                        flush=True
+                    )
+                    print(
+                        f"[p_sample_loop] step={i}, var min/mean/max: "
+                        f"{var.min().item()}, {var.mean().item()}, {var.max().item()}",
+                        flush=True
+                    )
+
                 x_t = mean + var.sqrt() * noise
 
-        return x_t
+        # after loop ends, x0_pred is your final predicted “clean” latent
+        return x0_pred
+
 
 
     def apply_embedding_guidance(
@@ -427,11 +464,6 @@ class GuidedDiffusion(nn.Module):
         guidance_scale: float,
         target_embedding: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        1) decode partial latent => text
-        2) embed => measure alignment
-        3) do naive finite-diff => nudge x0_pred
-        """
         pm = self._parent()
         if pm is None:
             return x0_pred
@@ -445,7 +477,6 @@ class GuidedDiffusion(nn.Module):
             lat_mean = x0_pred
 
         texts = pm._decode_latent_to_text(lat_mean)
-
         new_embs = []
         for text in texts:
             tokenized = pm.embedder_tokenizer([text], return_tensors="pt", padding=True, truncation=True).to(device)
@@ -460,11 +491,9 @@ class GuidedDiffusion(nn.Module):
             cos_sim = F.cosine_similarity(new_embs, target_embedding, dim=-1).mean()
             avg_score = cos_sim.item()
         else:
-            # negative MSE
             mse_val = F.mse_loss(new_embs, target_embedding)
             avg_score = -mse_val.item()
 
-        # do finite difference
         partial_dims = min(10, lat_mean.numel())
         dim_list = torch.randperm(lat_mean.numel(), device=device)[:partial_dims]
         best_update = torch.zeros_like(lat_mean)
@@ -567,7 +596,6 @@ class InversionModel(transformers.PreTrainedModel):
 
         encoder_hidden_dim = self.encoder_decoder.config.hidden_size
         if embedder_model_api:
-            # Hard-code e.g. OpenAI dimension
             self.embedder_dim = 1536
             bottleneck_dim = self.embedder_dim
         elif isinstance(embedder, SentenceTransformer):
@@ -628,11 +656,10 @@ class InversionModel(transformers.PreTrainedModel):
         self.diffusion_inference_guidance_scale = getattr(config, "diffusion_inference_guidance_scale", 0.0)
         self.diffusion_inference_guidance_freq = getattr(config, "diffusion_inference_guidance_freq", 9999999999)
 
-        # possible other config fields for guidance mode (cosine vs. mse) or finite diff
+        # possible other config fields
         self.diffusion_guidance_mode = getattr(config, "diffusion_guidance_mode", "cosine")
         self.diffusion_guidance_finite_diff_eps = getattr(config, "diffusion_guidance_finite_diff_eps", 1e-3)
 
-        # build submodule
         if self.use_diffusion:
             self.guided_diffusion = GuidedDiffusion(
                 parent_model=self,
@@ -697,7 +724,6 @@ class InversionModel(transformers.PreTrainedModel):
             B = input_ids.size(0)
             return torch.zeros((B, self.embedder_dim), dtype=torch.float32, device=self.embedder_device)
         elif self.embedder_model_api:
-            # external API
             embeddings = embed_api(
                 input_ids=input_ids,
                 embedder_tokenizer=self.embedder_tokenizer,
@@ -710,7 +736,6 @@ class InversionModel(transformers.PreTrainedModel):
             model_output = self.embedder(model_inputs)
             embeddings = model_output["sentence_embedding"]
         else:
-            # local huggingface model
             model_output = self.embedder(input_ids=input_ids, attention_mask=attention_mask)
             embeddings = self._process_embedder_output(model_output, attention_mask)
 
@@ -732,7 +757,9 @@ class InversionModel(transformers.PreTrainedModel):
         else:
             embeddings = self.call_embedding_model(embedder_input_ids, embedder_attention_mask)
 
-        # transform to repeated T5 input
+        # (3) Scale down latents to avoid huge reverse blowups
+        embeddings = 0.1 * embeddings  # or apply layernorm, etc.
+
         repeated_embeddings = self.embedding_transform(embeddings)
         B = repeated_embeddings.size(0)
         hidden_dim = self.encoder_decoder.config.hidden_size
@@ -746,14 +773,10 @@ class InversionModel(transformers.PreTrainedModel):
         inputs: Dict[str, torch.Tensor],
         generation_kwargs: Dict[str, torch.Tensor],
     ) -> torch.Tensor:
-        """
-        Perform diffusion-based generation but return a typical T5 sequence shape [batch, seq_len].
-        """
         if not self.use_diffusion:
             debug_print("---Not using diffusion---")
             return self._naive_generate(inputs, generation_kwargs)
 
-        # 1) embed & project => shape [B, orig_seq_len, hidden_dim]
         inputs_embeds, _ = self.embed_and_project(
             embedder_input_ids=inputs.get("embedder_input_ids"),
             embedder_attention_mask=inputs.get("embedder_attention_mask"),
@@ -762,19 +785,19 @@ class InversionModel(transformers.PreTrainedModel):
         debug_print(f'--inputs_embeds.shape: {inputs_embeds.shape}')
         lat_mean = inputs_embeds.mean(dim=1, keepdim=True)
 
-        # 2) partial noising => x_T (use q_sample to keep formula consistent)
         if not hasattr(self, "_diffusion_compress"):
             self._diffusion_compress = nn.Linear(lat_mean.size(-1), self.latent_dim).to(self.device)
         z0 = self._diffusion_compress(lat_mean)
-        print(f"--generate() :: z0: {z0}")
-        print(f"--generate() :: z0 min/mean/max: {z0.min()}, {z0.mean()}, {z0.max()}")
+
+        debug_print(f"--generate() :: z0: {z0}")
+        debug_print(f"--generate() :: z0 min/mean/max: {z0.min()}, {z0.mean()}, {z0.max()}")
+
         T = self.diffusion_timesteps
         noise = torch.randn_like(z0)
 
-        # Clean approach: just call q_sample with t = T-1
+        # partial noising => xT
         xT = self.guided_diffusion.q_sample(z0, t=T-1, noise=noise)
 
-        # 3) reverse diffusion => final latent x0
         refine_steps = generation_kwargs.pop("refine_steps", T)
         target_emb = inputs.get("target_embedding", None)
         x0 = self.guided_diffusion.p_sample_loop(
@@ -785,13 +808,11 @@ class InversionModel(transformers.PreTrainedModel):
             target_embedding=target_emb,
         )
 
-        # 4) expand x0 => shape [B, orig_seq_len, hidden_dim]
         if not hasattr(self, "_diffusion_expand"):
             self._diffusion_expand = nn.Linear(self.latent_dim, lat_mean.size(-1)).to(self.device)
         expanded = self._diffusion_expand(x0).expand(-1, inputs_embeds.size(1), -1)
         debug_print(f"---expanded: {expanded}---")
 
-        # 5) T5 generate => typical shape [batch_size, dec_len]
         attention_mask = torch.ones(
             (expanded.size(0), expanded.size(1)),
             dtype=torch.long,
@@ -805,7 +826,6 @@ class InversionModel(transformers.PreTrainedModel):
         )
         debug_print(f"---out_ids: {out_ids}---")
 
-        # 6) (Optional) pad to a fixed max_length
         max_len = generation_kwargs.get("max_length", 128)
         if out_ids.size(1) < max_len:
             pad_amount = max_len - out_ids.size(1)
@@ -864,10 +884,15 @@ class InversionModel(transformers.PreTrainedModel):
         if self.use_diffusion and self.training:
             debug_print(f"---forward() :: Using diffusion and training---")
             lat_mean = inputs_embeds.mean(dim=1, keepdim=True)
+
             if not hasattr(self, "_diffusion_compress"):
                 self._diffusion_compress = nn.Linear(lat_mean.size(-1), self.latent_dim).to(self.device)
             z0 = self._diffusion_compress(lat_mean)
 
+            # (3) scale down again if you like, or rely on embed_and_project scaling
+            # z0 = 0.1 * z0 
+
+            # call v-pred diffusion forward
             diff_loss = self.guided_diffusion(
                 z0,
                 t=None,
@@ -895,13 +920,13 @@ class InversionModel(transformers.PreTrainedModel):
     def _decode_latent_to_text(self, latent: torch.Tensor) -> list:
         """
         Used by apply_embedding_guidance in p_sample_loop to do partial decode 
-        from a single-step latent. We do a small linear -> T5 -> decode.
+        from a single-step latent.
         """
         B, L, D = latent.shape
         if not hasattr(self, "_diffusion_expand"):
             self._diffusion_expand = nn.Linear(D, self.encoder_decoder.config.hidden_size).to(self.device)
 
-        hidden = self._diffusion_expand(latent)  # => (B,L, hidden_size)
+        hidden = self._diffusion_expand(latent)
         attn_mask = torch.ones((B,L), dtype=torch.long, device=latent.device)
         out_ids = self.encoder_decoder.generate(
             inputs_embeds=hidden,
