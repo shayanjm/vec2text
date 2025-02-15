@@ -350,7 +350,25 @@ class GuidedDiffusion(nn.Module):
         cos_sim = F.cosine_similarity(new_embs, target_emb, dim=-1).mean()
         guidance_loss = -cos_sim
         return guidance_loss
-    
+
+    def _percentile_dynamic_threshold(self, x0: torch.Tensor, percentile=0.995) -> torch.Tensor:
+        """
+        Rescale x0 so that the given percentile of abs(x0) is at most 1.0,
+        i.e. limit outliers. If the percentile is below 1.0, do nothing.
+        """
+        # 1) flatten absolute values
+        abs_vals = x0.abs().reshape(-1)
+
+        # 2) compute the quantile
+        thresh_val = torch.quantile(abs_vals, percentile)
+
+        # 3) if thresh_val > 1.0, rescale
+        if thresh_val > 1.0:
+            scale = 1.0 / (thresh_val + 1e-7)
+            x0 = x0 * scale
+
+        return x0
+
     def p_sample_loop(
         self,
         x_T,
@@ -360,15 +378,16 @@ class GuidedDiffusion(nn.Module):
         target_embedding: Optional[torch.Tensor] = None,
     ):
         """
-        Reverse diffusion from x_T => x_0, with partial guidance calls every
-        inference_guidance_freq steps, using a consistent v-pred approach.
+        Reverse diffusion from x_T => x_0 using v-pred + percentile-based dynamic thresholding
+        to limit large latents. (Similar to Stable Diffusion's approach.)
         """
         if steps is None:
             steps = self.timesteps
 
         x_t = x_T.clone()
-        # optional: just store z_hat if you do self-conditioning at inference
-        z_hat = torch.zeros_like(x_t)
+        z_hat = torch.zeros_like(x_t)  # if using self-conditioning at inference
+
+        percentile = 0.995
 
         for i in reversed(range(steps)):
             t_tensor = torch.full((x_t.size(0),), i, device=x_t.device, dtype=torch.long)
@@ -381,20 +400,21 @@ class GuidedDiffusion(nn.Module):
                 )
 
             # -------------------------------------------------
-            # (1) predict v from the current sample x_t
+            # (1) v_pred
             v_pred = self.denoiser(x_t, z_hat, t_tensor)
 
             # -------------------------------------------------
-            # (2) get alpha_bar[t], then compute eps_pred
-            # v = sqrt(a)*eps - sqrt(1-a)* x_t
-            # => eps = ( v + sqrt(1-a)* x_t ) / sqrt(a)
-            alpha_bar = self.alphas_cumprod[t_tensor].view(-1, 1, 1)
+            # (2) eps_pred = (v_pred + sqrt(1-a)* x_t) / sqrt(a)
+            alpha_bar = self.alphas_cumprod[t_tensor].view(-1,1,1)
             eps_pred = (v_pred + (1 - alpha_bar).sqrt() * x_t) / (alpha_bar.sqrt() + 1e-7)
 
             # -------------------------------------------------
-            # (3) Now get x0_pred from x_t and eps_pred
-            # x0 = ( x_t - sqrt(1-a)*eps ) / sqrt(a)
+            # (3) x0_pred = (x_t - sqrt(1-a)* eps_pred) / sqrt(a)
             x0_pred = (x_t - (1 - alpha_bar).sqrt() * eps_pred) / (alpha_bar.sqrt() + 1e-7)
+
+            # -------------------------------------------------
+            # (4) Dynamic threshold / percentile-based rescaling
+            x0_pred = self._percentile_dynamic_threshold(x0_pred, percentile=percentile)
 
             if i % 5 == 0:
                 print(
@@ -404,7 +424,7 @@ class GuidedDiffusion(nn.Module):
                 )
 
             # -------------------------------------------------
-            # (4) If inference guidance is used, apply partial decode guidance
+            # (5) Guidance
             if (
                 inference_guidance_scale > 0.0
                 and (i % inference_guidance_freq == 0)
@@ -415,22 +435,20 @@ class GuidedDiffusion(nn.Module):
                     inference_guidance_scale,
                     target_embedding=target_embedding,
                 )
+                # re-apply threshold after guidance
+                x0_pred = self._percentile_dynamic_threshold(x0_pred, percentile=percentile)
 
-            # optional: for self-conditioning, you might do z_hat = x0_pred or similar
+            # If using self-conditioning, store x0_pred
             z_hat = x0_pred.detach()
 
             # -------------------------------------------------
-            # (5) If not the final step, sample x_{t-1}
+            # (6) If not at step=0, sample x_{t-1}
             if i > 0:
-                beta_t = self.betas[t_tensor].view(-1, 1, 1)
-                alpha_bar_prev = self.alphas_cumprod[t_tensor - 1].view(-1, 1, 1)
-
-                # clamp to avoid near-zero denominators
+                beta_t = self.betas[t_tensor].view(-1,1,1)
+                alpha_bar_prev = self.alphas_cumprod[t_tensor - 1].view(-1,1,1)
+                # Avoid near-zero denominators
                 safe_denom = torch.clamp((1 - alpha_bar).sqrt(), min=1e-4)
 
-                # standard DDPM posterior: 
-                #    mean = sqrt(alpha_{t-1}) * x_0_pred + ...
-                # but we keep your code's approach with the safe_denom
                 mean = (
                     x0_pred * alpha_bar_prev.sqrt()
                     + (x_t - x0_pred * alpha_bar.sqrt()) * (1 - alpha_bar_prev).sqrt()
@@ -451,12 +469,10 @@ class GuidedDiffusion(nn.Module):
                         flush=True
                     )
 
+                # Optionally you could also do dynamic threshold on 'mean' if necessary
                 x_t = mean + var.sqrt() * noise
 
-        # after loop ends, x0_pred is your final predicted “clean” latent
         return x0_pred
-
-
 
     def apply_embedding_guidance(
         self,
